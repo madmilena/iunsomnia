@@ -1,0 +1,124 @@
+import { expect } from '@playwright/test';
+
+import { test } from '../../playwright/test';
+
+test('can send requests', async ({ page, insomnia }) => {
+  test.slow(process.platform === 'darwin' || process.platform === 'win32', 'Slow app start on these platforms');
+
+  const statusTag = page.locator('[data-testid="response-status-tag"]:visible');
+  const responseBody = page.getByTestId('response-pane');
+
+  await insomnia.projectPage.importFixture('smoke-test-collection.yaml');
+
+  await page.getByTestId('workspace-context-dropdown').click();
+  await page.getByRole('menuitemradio', { name: 'Export' }).click();
+  await page.getByRole('button', { name: 'Export' }).click();
+  await page.getByText('Which format would you like to export as?').click();
+  await insomnia.pressEscape();
+
+  await page.getByLabel('Create in collection').click();
+  await page.getByRole('menuitemradio', { name: 'From Curl' }).click();
+  await page.locator('.CodeMirror textarea').fill('curl --request GET --url http://127.0.0.1:4010/echo');
+  await page.getByRole('dialog').getByRole('button', { name: 'Import' }).click();
+
+  await expect
+    .soft(page.getByTestId('request-pane').getByTestId('OneLineEditor').getByText(`http://127.0.0.1:4010/echo`))
+    .toBeVisible();
+  await page.getByTestId('request-pane').getByRole('button', { name: 'Send' }).click();
+  await expect.soft(statusTag).toContainText('200 OK');
+
+  await page.getByLabel('Request Collection').getByTestId('send JSON request').press('Enter');
+  await expect
+    .soft(page.getByTestId('request-pane').getByTestId('OneLineEditor').getByText(`http://127.0.0.1:4010/pets/1`))
+    .toBeVisible();
+  await page.getByTestId('request-pane').getByRole('button', { name: 'Send' }).click();
+  await expect.soft(statusTag).toContainText('200 OK');
+  await expect.soft(responseBody).toContainText('"id": "1"');
+  await page.getByRole('button', { name: 'Preview' }).click();
+  await page.getByRole('menuitem', { name: 'Raw Data' }).click();
+  await expect.soft(responseBody).toContainText('{"id":"1"}');
+
+  await page
+    .getByLabel('Request Collection')
+    .getByTestId('connects to event stream and shows ping response')
+    .press('Enter');
+  await expect
+    .soft(page.getByTestId('request-pane').getByTestId('OneLineEditor').getByText(`http://127.0.0.1:4010/events`))
+    .toBeVisible();
+  await page.getByTestId('request-pane').getByRole('button', { name: 'Connect' }).click();
+  await expect.soft(statusTag).toContainText('200 OK');
+  await page.getByRole('tab', { name: 'Console' }).click();
+  await expect.soft(responseBody).toContainText('Connected to 127.0.0.1');
+  await page.getByTestId('request-pane').getByRole('button', { name: 'Disconnect' }).click();
+
+  await page
+    .getByLabel('Request Collection')
+    .getByTestId('sends dummy.csv request and shows rich response')
+    .press('Enter');
+  await expect
+    .soft(
+      page.getByTestId('request-pane').getByTestId('OneLineEditor').getByText(`http://127.0.0.1:4010/file/dummy.csv`),
+    )
+    .toBeVisible();
+  await page.getByTestId('request-pane').getByRole('button', { name: 'Send' }).click();
+  await expect.soft(statusTag).toContainText('200 OK');
+  await page.getByRole('button', { name: 'Preview' }).click();
+  await page.getByRole('menuitem', { name: 'Raw Data' }).click();
+  await expect.soft(responseBody).toContainText('a,b,c');
+
+  await page
+    .getByLabel('Request Collection')
+    .getByTestId('sends dummy.xml request and shows raw response')
+    .press('Enter');
+  await expect
+    .soft(
+      page.getByTestId('request-pane').getByTestId('OneLineEditor').getByText(`http://127.0.0.1:4010/file/dummy.xml`),
+    )
+    .toBeVisible();
+  await page.getByTestId('request-pane').getByRole('button', { name: 'Send' }).click();
+  await expect.soft(statusTag).toContainText('200 OK');
+  await expect.soft(responseBody).toContainText('xml version="1.0"');
+  await expect.soft(responseBody).toContainText('<LoginResult>');
+
+  await page
+    .getByLabel('Request Collection')
+    .getByTestId('sends dummy.pdf request and shows rich response')
+    .press('Enter');
+  await expect
+    .soft(
+      page.getByTestId('request-pane').getByTestId('OneLineEditor').getByText(`http://127.0.0.1:4010/file/dummy.pdf`),
+    )
+    .toBeVisible();
+  await page.getByTestId('request-pane').getByRole('button', { name: 'Send' }).click();
+  await expect.soft(statusTag).toContainText('200 OK');
+  await page.getByRole('tab', { name: 'Console' }).click();
+  await page.locator('pre').filter({ hasText: '< Content-Type: application/pdf' }).click();
+
+  await page.getByLabel('Request Collection').getByTestId('sends request with basic authentication').press('Enter');
+  await page.getByTestId('request-pane').getByRole('button', { name: 'Send' }).click();
+  await expect.soft(statusTag).toContainText('200 OK');
+  await expect.soft(responseBody).toContainText('basic auth received');
+
+  await page
+    .getByLabel('Request Collection')
+    .getByTestId('sends request with cookie and get cookie in response')
+    .press('Enter');
+  await expect
+    .soft(page.getByTestId('request-pane').getByTestId('OneLineEditor').getByText(`http://127.0.0.1:4010/cookies`))
+    .toBeVisible();
+  await page.getByTestId('request-pane').getByRole('button', { name: 'Send' }).click();
+  await expect.soft(statusTag).toContainText('200 OK');
+  await page.getByRole('tab', { name: 'Console' }).click();
+  await expect.soft(responseBody).toContainText('Set-Cookie: insomnia-test-cookie=value123');
+
+  await page.getByLabel('Request Collection').getByTestId('delayed request').press('Enter');
+  await expect
+    .soft(
+      page.getByTestId('request-pane').getByTestId('OneLineEditor').getByText(`http://127.0.0.1:4010/delay/seconds/20`),
+    )
+    .toBeVisible();
+  await page.getByTestId('request-pane').getByRole('button', { name: 'Send' }).click();
+
+  await page.getByRole('button', { name: 'Cancel Request' }).click();
+  await page.getByText('Request was cancelled').click();
+});

@@ -1,0 +1,78 @@
+import classnames from 'classnames';
+import React, { type CSSProperties, type ReactNode } from 'react';
+import { mergeProps, OverlayContainer, useOverlayPosition, useTooltip, useTooltipTrigger } from 'react-aria';
+import { createPortal } from 'react-dom';
+import { useTooltipTriggerState } from 'react-stately';
+
+interface Props {
+  children: ReactNode;
+  message: ReactNode;
+  position?: 'bottom' | 'top' | 'right' | 'left';
+  className?: string;
+  selectable?: boolean;
+  delay?: number;
+  wide?: boolean;
+  style?: CSSProperties;
+  onClick?: () => void;
+}
+
+export const Tooltip = (props: Props) => {
+  const { children, message, className, wide, selectable, delay = 400, position, style } = props;
+  const triggerRef = React.useRef<HTMLDivElement>(null);
+  const overlayRef = React.useRef<HTMLDivElement>(null);
+
+  const state = useTooltipTriggerState({ delay });
+  const trigger = useTooltipTrigger(props, state, triggerRef);
+  const tooltip = useTooltip(trigger.tooltipProps, state);
+
+  const { overlayProps: positionProps } = useOverlayPosition({
+    targetRef: triggerRef,
+    overlayRef,
+    placement: position,
+    offset: 5,
+    isOpen: state.isOpen,
+  });
+
+  const tooltipClasses = classnames(className, 'tooltip');
+  const bubbleClasses = classnames('tooltip__bubble theme--tooltip', {
+    'tooltip__bubble--visible': state.isOpen,
+    'tooltip__bubble--wide': wide,
+    selectable,
+  });
+
+  const overlayContent = message ? (
+    <div
+      ref={overlayRef}
+      onClick={e => e.stopPropagation()}
+      {...mergeProps(tooltip.tooltipProps, positionProps)}
+      className={bubbleClasses}
+    >
+      {message}
+    </div>
+  ) : null;
+
+  const modalContainer = triggerRef.current?.closest('[aria-label="Modal"]');
+
+  return (
+    <>
+      <div
+        ref={triggerRef}
+        className={tooltipClasses}
+        style={{ position: 'relative', ...style }}
+        {...trigger.triggerProps}
+        onClick={props.onClick}
+      >
+        {children}
+      </div>
+      {state.isOpen &&
+        overlayContent &&
+        (modalContainer ? (
+          // Render tooltip inside modal if exists.
+          // Otherwise OverlayContainer becomes inert and breaks hover event listener: INS-1930
+          createPortal(overlayContent, modalContainer)
+        ) : (
+          <OverlayContainer>{overlayContent}</OverlayContainer>
+        ))}
+    </>
+  );
+};

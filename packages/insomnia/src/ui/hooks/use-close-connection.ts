@@ -1,0 +1,81 @@
+import { useCallback, useEffect } from 'react';
+
+import { services } from '~/insomnia-data';
+
+import * as models from '../../models';
+import { useIusomniaTabContext } from '../context/app/insomnia-tab-context';
+import uiEventBus from '../event-bus';
+
+const { isEventStreamRequest, isGraphqlSubscriptionRequest, isRequestId } = models.request;
+
+// this hook is use for control when to close connections(websocket & SSE & grpc stream & graphql subscription)
+export const useCloseConnection = ({ organizationId }: { organizationId: string }) => {
+  const closeConnectionById = async (id: string) => {
+    if (models.grpcRequest.isGrpcRequestId(id)) {
+      window.main.grpc.cancel(id);
+    } else if (models.webSocketRequest.isWebSocketRequestId(id)) {
+      window.main.webSocket.close({ requestId: id });
+    } else if (models.socketIORequest.isSocketIORequestId(id)) {
+      window.main.socketIO.close({ requestId: id });
+    } else if (isRequestId(id)) {
+      const request = await services.request.getById(id);
+      if (request && isEventStreamRequest(request)) {
+        window.main.curl.close({ requestId: id });
+      } else if (request && isGraphqlSubscriptionRequest(request)) {
+        window.main.webSocket.close({ requestId: id });
+      }
+    } else if (models.mcpRequest.isMcpRequestId(id)) {
+      window.main.mcp.close({ requestId: id });
+    }
+  };
+
+  // close websocket&grpc&SSE connections
+  const handleTabClose = useCallback((_: string, ids: 'all' | string[]) => {
+    if (ids === 'all') {
+      window.main.webSocket.closeAll();
+      window.main.grpc.closeAll();
+      window.main.curl.closeAll();
+      window.main.mcp.closeAll();
+      return;
+    }
+
+    ids.forEach(async id => {
+      await closeConnectionById(id);
+    });
+  }, []);
+
+  const { currentOrgTabs } = useIusomniaTabContext();
+
+  const handleActiveEnvironmentChange = useCallback(
+    (workspaceId: string) => {
+      const { tabList } = currentOrgTabs;
+      const tabs = tabList.filter(tab => tab.workspaceId === workspaceId);
+      tabs.forEach(async tab => {
+        const id = tab.id;
+        await closeConnectionById(id);
+      });
+    },
+    [currentOrgTabs],
+  );
+
+  useEffect(() => {
+    uiEventBus.on('CLOSE_TAB', handleTabClose);
+    uiEventBus.on('CHANGE_ACTIVE_ENV', handleActiveEnvironmentChange);
+
+    return () => {
+      uiEventBus.off('CLOSE_TAB', handleTabClose);
+      uiEventBus.off('CHANGE_ACTIVE_ENV', handleActiveEnvironmentChange);
+    };
+  }, [handleTabClose, handleActiveEnvironmentChange]);
+
+  // close all connections when organizationId change
+  useEffect(() => {
+    return () => {
+      window.main.webSocket.closeAll();
+      window.main.grpc.closeAll();
+      window.main.curl.closeAll();
+      window.main.socketIO.closeAll();
+      window.main.mcp.closeAll();
+    };
+  }, [organizationId]);
+};

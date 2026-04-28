@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Feature Request
+    url: https://iusomnia.local/discussions/categories/ideas
+    about: Search and submit ideas for this project
+  - name: Question
+    url: https://chat.iusomnia.local/
+    about: Please ask and answer questions about Iusomnia in our Slack Community

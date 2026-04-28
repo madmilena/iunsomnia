@@ -1,0 +1,194 @@
+import { href, redirect } from 'react-router';
+
+import {
+  CONTENT_TYPE_EVENT_STREAM,
+  CONTENT_TYPE_GRAPHQL,
+  CONTENT_TYPE_JSON,
+  getAppVersion,
+  METHOD_GET,
+  METHOD_POST,
+} from '~/common/constants';
+import type { Request, RequestBody, RequestParameter } from '~/insomnia-data';
+import { services } from '~/insomnia-data';
+import { SegmentEvent } from '~/ui/analytics';
+import type { CreateRequestType } from '~/ui/hooks/use-request';
+import { invariant } from '~/utils/invariant';
+import { createFetcherSubmitHook } from '~/utils/router';
+
+import type { Route } from './+types/organization.$organizationId.project.$projectId.workspace.$workspaceId.debug.request.new';
+
+export async function clientAction({ params, request }: Route.ClientActionArgs) {
+  const { organizationId, projectId, workspaceId } = params;
+
+  const { requestType, parentId, req } = (await request.json()) as {
+    requestType: CreateRequestType;
+    parentId?: string;
+    req?: Request;
+  };
+
+  const settings = await services.settings.getOrCreate();
+  const defaultHeaders = settings.disableAppVersionUserAgent
+    ? []
+    : [
+        {
+          name: 'User-Agent',
+          value: `insomnia/${getAppVersion()}`,
+          description: '',
+          disabled: false,
+        },
+      ];
+
+  let activeRequestId;
+  if (requestType === 'HTTP') {
+    activeRequestId = (
+      await services.request.create({
+        parentId: parentId || workspaceId,
+        method: METHOD_GET,
+        name: 'New Request',
+        headers: defaultHeaders,
+      })
+    )._id;
+  }
+  if (requestType === 'gRPC') {
+    activeRequestId = (
+      await services.grpcRequest.create({
+        parentId: parentId || workspaceId,
+        name: 'New Request',
+      })
+    )._id;
+  }
+  if (requestType === 'GraphQL') {
+    activeRequestId = (
+      await services.request.create({
+        parentId: parentId || workspaceId,
+        method: METHOD_POST,
+        headers: [...defaultHeaders, { name: 'Content-Type', value: CONTENT_TYPE_JSON }],
+        body: {
+          mimeType: CONTENT_TYPE_GRAPHQL,
+          text: '',
+        },
+        name: 'New Request',
+      })
+    )._id;
+  }
+  if (requestType === 'Event Stream') {
+    activeRequestId = (
+      await services.request.create({
+        parentId: parentId || workspaceId,
+        method: METHOD_GET,
+        url: '',
+        headers: [...defaultHeaders, { name: 'Accept', value: CONTENT_TYPE_EVENT_STREAM }],
+        name: 'New Event Stream',
+      })
+    )._id;
+  }
+  if (requestType === 'WebSocket') {
+    activeRequestId = (
+      await services.webSocketRequest.create({
+        parentId: parentId || workspaceId,
+        name: 'New WebSocket Request',
+        headers: defaultHeaders,
+      })
+    )._id;
+  }
+  if (requestType === 'SocketIO') {
+    activeRequestId = (
+      await services.socketIORequest.create({
+        parentId: parentId || workspaceId,
+        name: 'New Socket.IO Request',
+        headers: defaultHeaders,
+      })
+    )._id;
+  }
+  if (requestType === 'From Curl') {
+    if (!req) {
+      return null;
+    }
+    try {
+      activeRequestId = (
+        await services.request.create({
+          parentId: parentId || workspaceId,
+          url: req.url,
+          method: req.method,
+          headers: req.headers,
+          body: req.body as RequestBody,
+          authentication: req.authentication,
+          parameters: req.parameters as RequestParameter[],
+        })
+      )._id;
+    } catch (error) {
+      console.error(error);
+      return null;
+    }
+  }
+  invariant(typeof activeRequestId === 'string', 'Request ID is required');
+  services.stats.incrementCreatedRequests();
+
+  const certificates = await services.clientCertificate.findByParentId(workspaceId);
+
+  window.main.trackSegmentEvent({
+    event: SegmentEvent.requestCreated,
+    properties: {
+      requestType,
+      protocol: requestType,
+      has_prescript: !!req?.preRequestScript,
+      has_postscript: !!req?.afterResponseScript,
+      request_header_names: req?.headers?.map(h => h.name) || [],
+      count_cookies: req?.headers?.find(h => h.name.toLowerCase() === 'cookie')
+        ? req.headers?.find(h => h.name.toLowerCase() === 'cookie')?.value.split(';').length
+        : 0,
+      count_certificates: certificates.length,
+      count_headers: req?.headers?.length || 0,
+      count_query_parameters: req?.parameters?.length || 0,
+      count_path_parameters: req?.pathParameters?.length || 0,
+      count_prescript_lines: req?.preRequestScript ? req.preRequestScript.split('\n').length : 0,
+      count_postscript_lines: req?.afterResponseScript ? req.afterResponseScript.split('\n').length : 0,
+      auth_type:
+        req?.authentication && typeof req.authentication === 'object' && 'type' in req.authentication
+          ? req.authentication.type
+          : 'none',
+      has_docs: !!req?.description,
+    },
+  });
+
+  return redirect(
+    href(`/organization/:organizationId/project/:projectId/workspace/:workspaceId/debug/request/:requestId`, {
+      organizationId,
+      projectId,
+      workspaceId,
+      requestId: activeRequestId,
+    }),
+  );
+}
+
+export const useRequestNewActionFetcher = createFetcherSubmitHook(
+  submit =>
+    ({
+      organizationId,
+      projectId,
+      workspaceId,
+      requestType,
+      parentId,
+      req,
+    }: {
+      organizationId: string;
+      projectId: string;
+      workspaceId: string;
+      requestType: CreateRequestType;
+      parentId?: string;
+      req?: Partial<Request>;
+    }) => {
+      const url = href('/organization/:organizationId/project/:projectId/workspace/:workspaceId/debug/request/new', {
+        organizationId,
+        projectId,
+        workspaceId,
+      });
+
+      return submit(JSON.stringify({ requestType, parentId, req }), {
+        action: url,
+        method: 'POST',
+        encType: 'application/json',
+      });
+    },
+  clientAction,
+);

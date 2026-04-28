@@ -1,0 +1,5 @@
+#!/usr/bin/env -S node --enable-source-maps
+
+global.require = require;
+const insomniacli = require('../dist/index.js');
+insomniacli.go();

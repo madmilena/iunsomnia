@@ -1,0 +1,173 @@
+import React, { forwardRef, useImperativeHandle, useRef, useState } from 'react';
+import { Button } from 'react-aria-components';
+
+import { CodeEditor } from '~/ui/components/.client/codemirror/code-editor';
+import { useI18n } from '~/ui/i18n';
+
+import { CopyButton } from '../base/copy-button';
+import { Dropdown, DropdownItem, DropdownSection, ItemContent } from '../base/dropdown';
+import { Modal, type ModalHandle, type ModalProps } from '../base/modal';
+import { ModalBody } from '../base/modal-body';
+import { ModalFooter } from '../base/modal-footer';
+import { ModalHeader } from '../base/modal-header';
+import { MarkdownEditor } from '../markdown-editor';
+
+const MODES: Record<string, string> = {
+  'text/plain': 'Plain Text',
+  'application/json': 'JSON',
+  'application/xml': 'XML',
+  'application/edn': 'EDN',
+  'text/x-markdown': 'Markdown',
+  'text/html': 'HTML',
+};
+
+interface CodePromptModalOptions {
+  title: string;
+  defaultValue: string;
+  submitName: string;
+  placeholder?: string;
+  hint?: string;
+  mode: string;
+  hideMode?: boolean;
+  showCopyButton?: boolean;
+  onChange: (value: string) => void;
+  onModeChange?: (value: string) => void;
+}
+
+export interface CodePromptModalHandle {
+  show: (options: CodePromptModalOptions) => void;
+  hide: () => void;
+  setError: (error: string) => void;
+}
+export const CodePromptModal = forwardRef<CodePromptModalHandle, ModalProps>((_, ref) => {
+  const { t } = useI18n();
+  const modalRef = useRef<ModalHandle>(null);
+  const [error, setError] = useState('');
+  const [state, setState] = useState<CodePromptModalOptions>({
+    title: t('modals.notSet'),
+    defaultValue: '',
+    submitName: t('modals.notSet'),
+    placeholder: '',
+    hint: '',
+    mode: 'text/plain',
+    hideMode: false,
+    showCopyButton: false,
+    onChange: () => {},
+    onModeChange: () => {},
+  });
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      hide: () => {
+        modalRef.current?.hide();
+      },
+      show: options => {
+        const realMode = typeof options.mode === 'string' ? options.mode : 'text/plain';
+        setState(state => ({
+          ...options,
+          mode: realMode || state.mode || 'text/plain',
+        }));
+        modalRef.current?.show();
+      },
+      setError: (error: string) => setError(error),
+    }),
+    [],
+  );
+
+  const { submitName, title, placeholder, defaultValue, hint, mode, hideMode, showCopyButton, onChange } = state;
+
+  return (
+    <Modal ref={modalRef} tall>
+      <ModalHeader>{title}</ModalHeader>
+      <ModalBody
+        noScroll
+        className="wide tall"
+        style={
+          showCopyButton
+            ? {
+                display: 'grid',
+                gridTemplateColumns: 'minmax(0, 1fr)',
+                gridTemplateRows: 'auto minmax(0, 1fr)',
+              }
+            : {
+                minHeight: '10rem',
+              }
+        }
+      >
+        {showCopyButton ? (
+          <div className="pad-top-sm pad-right-sm">
+            <CopyButton content={defaultValue} className="pull-right" />
+          </div>
+        ) : null}
+        {mode === 'text/x-markdown' ? (
+          <div className="pad-sm tall">
+            <MarkdownEditor
+              tall
+              defaultValue={defaultValue}
+              placeholder={placeholder}
+              onChange={onChange}
+              mode={mode}
+            />
+          </div>
+        ) : (
+          <div className="tall rounded-sm bg-(--hl-xs)">
+            <CodeEditor
+              id="code-prompt-modal"
+              hideLineNumbers
+              showPrettifyButton
+              defaultValue={defaultValue}
+              placeholder={placeholder}
+              onChange={onChange}
+              mode={mode}
+              enableNunjucks
+            />
+          </div>
+        )}
+      </ModalBody>
+      <ModalFooter>
+        {!hideMode ? (
+          <Dropdown
+            aria-label={t('modals.selectMode')}
+            triggerButton={
+              <Button className="rounded-xs! border! border-solid! border-(--hl-md)! bg-transparent! px-3! py-2! text-(--color-font)! transition-colors! hover:no-underline!">
+                {MODES[mode]}
+                <i className="fa fa-caret-down space-left" />
+              </Button>
+            }
+          >
+            <DropdownSection aria-label={t('modals.editorSyntax')} title={t('modals.editorSyntax')}>
+              {Object.keys(MODES).map(mode => (
+                <DropdownItem key={mode} aria-label={MODES[mode]}>
+                  <ItemContent
+                    icon="code"
+                    label={MODES[mode]}
+                    onClick={() => {
+                      setState(state => ({ ...state, mode }));
+                      state.onModeChange?.(mode);
+                    }}
+                  />
+                </DropdownItem>
+              ))}
+            </DropdownSection>
+          </Dropdown>
+        ) : null}
+        <div className="margin-left faint txt-sm italic">{hint ? `* ${hint}` : ''}</div>
+        {error !== '' && (
+          <p className="notice error w-full" style={{ marginTop: 0, marginBottom: 0 }}>
+            {error}
+          </p>
+        )}
+        <button
+          className="btn"
+          onClick={() => modalRef.current?.hide()}
+          disabled={error !== ''}
+          aria-label={t('modals.modalSubmit')}
+        >
+          {submitName || t('common.submit')}
+        </button>
+      </ModalFooter>
+    </Modal>
+  );
+});
+CodePromptModal.displayName = 'CodePromptModal';

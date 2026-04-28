@@ -1,0 +1,1043 @@
+import fs from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import nodePath from 'node:path';
+
+import * as commander from 'commander';
+import { cosmiconfig } from 'cosmiconfig';
+// @ts-expect-error the enquirer types are incomplete https://github.com/enquirer/enquirer/pull/307
+import { Confirm } from 'enquirer';
+import { pick } from 'es-toolkit';
+import { isDevelopment, JSON_ORDER_PREFIX, JSON_ORDER_SEPARATOR } from 'insomnia/src/common/constants';
+import { insomniaFetch } from 'insomnia/src/common/insomnia-fetch';
+import { getSendRequestCallbackMemDb } from 'insomnia/src/common/send-request';
+import { deserializeNDJSON } from 'insomnia/src/utils/ndjson';
+import { configureFetch } from 'insomnia-api';
+import { generate, runTestsCli } from 'insomnia-testing';
+import orderedJSON from 'json-order';
+import { parseArgsStringToArgv } from 'string-argv';
+import { v4 as uuidv4 } from 'uuid';
+
+import type { Environment, Request, RequestGroup, UserUploadEnvironment, Workspace } from '~/insomnia-data';
+import { initServices, models } from '~/insomnia-data';
+import { servicesNodeImpl } from '~/insomnia-data/node';
+
+import type { RequestTestResult } from '../../insomnia-scripting-environment/src/objects';
+import packageJson from '../package.json';
+import { flushAnalytics, InsoEvent, trackInsoEvent } from './analytics';
+import { exportSpecification, writeFileWithCliOptions } from './commands/export-specification';
+import { getRuleSetFileFromFolderByFilename, lintSpecification } from './commands/lint-specification';
+import { RunCollectionResultReport } from './commands/run-collection/result-report';
+import { isFile, loadDb } from './db';
+import { insomniaExportAdapter } from './db/adapters/insomnia-adapter';
+import { loadApiSpec, promptApiSpec } from './db/models/api-spec';
+import { loadEnvironment, promptEnvironment } from './db/models/environment';
+import type { BaseModel } from './db/models/types';
+import { loadTestSuites, promptTestSuites } from './db/models/unit-test-suite';
+import { matchIdIsh } from './db/models/util';
+import { loadWorkspace, promptWorkspace } from './db/models/workspace';
+import type { Database } from './db/types';
+import { InsoError } from './errors';
+import { BasicReporter, logger, LogLevel } from './logger';
+import { logTestResult, logTestResultSummary, reporterTypes, type TestReporter } from './reporter';
+import { generateDocumentation } from './scripts/docs';
+import { getAppDataDir, getDefaultProductName } from './util';
+
+initServices(servicesNodeImpl);
+
+export interface GlobalOptions {
+  ci: boolean;
+  config: string;
+  printOptions: boolean;
+  verbose: boolean;
+  workingDir: string;
+}
+
+if (!isDevelopment()) {
+  // in production, silence the deprecation warnings
+  process.removeAllListeners('warning');
+}
+
+configureFetch(options => insomniaFetch({ ...options }));
+
+export const tryToReadInsoConfigFile = async (configFile?: string, workingDir?: string) => {
+  try {
+    const explorer = await cosmiconfig('inso');
+    // set or detect .insorc in workingDir or cwd https://github.com/cosmiconfig/cosmiconfig?tab=readme-ov-file#explorersearch
+    const results = configFile ? await explorer.load(configFile) : await explorer.search(workingDir || process.cwd());
+
+    if (results && !results?.isEmpty) {
+      logger.debug(`Found config file at ${results?.filepath}.`);
+      const scripts = results.config?.scripts || {};
+      const filePath = results.filepath;
+      const options = ['workingDir', 'ci', 'verbose', 'printOptions'].reduce((acc, key) => {
+        const value = results.config?.options?.[key];
+        if (value) {
+          return { ...acc, [key]: value };
+        }
+        return acc;
+      }, {});
+
+      return { options, scripts, filePath };
+    }
+  } catch (error) {
+    // Report fatal error when loading from explicitly defined config file
+    if (configFile) {
+      console.log(`Could not find config file at ${configFile}.`);
+      console.error(error);
+    }
+  }
+
+  return {};
+};
+
+const localAppDir = getAppDataDir(getDefaultProductName());
+
+export const getAbsoluteFilePath = ({ workingDir, file }: { workingDir?: string; file: string }) => {
+  if (!file) {
+    return '';
+  }
+
+  if (workingDir) {
+    if (fs.existsSync(workingDir) && !fs.statSync(workingDir).isDirectory()) {
+      return nodePath.resolve(nodePath.dirname(workingDir), file);
+    }
+    return nodePath.resolve(workingDir, file);
+  }
+
+  return nodePath.resolve(process.cwd(), file);
+};
+export const logErrorAndExit = (err?: Error) => {
+  if (err instanceof InsoError) {
+    logger.fatal(err.message);
+    err.cause && logger.fatal(err.cause);
+  } else if (err) {
+    logger.fatal(err);
+  }
+
+  logger.info('To view tracing information, re-run `inso` with `--verbose`');
+  process.exit(1);
+};
+const noConsoleLog = async <T>(callback: () => Promise<T>): Promise<T> => {
+  const oldConsoleLog = console.log;
+  console.log = () => {};
+  try {
+    return await callback();
+  } finally {
+    console.log = oldConsoleLog;
+  }
+};
+
+const getWorkingDir = (options: { workingDir?: string }): string => {
+  if (options.workingDir) {
+    return nodePath.resolve(options.workingDir);
+  }
+
+  logger.warn('No working directory provided, using local app data directory.');
+  return localAppDir;
+};
+
+const resolveSpecInDatabase = async (identifier: string, options: GlobalOptions) => {
+  const pathToSearch = getWorkingDir(options);
+
+  const db = await loadDb({ pathToSearch, filterTypes: ['ApiSpec'] });
+  if (!db.ApiSpec.length) {
+    throw new InsoError(`Specification content not found using API spec id: "${identifier}" in "${pathToSearch}"`);
+  }
+  const specFromDb = identifier ? loadApiSpec(db, identifier) : await promptApiSpec(db, options.ci);
+  if (!specFromDb?.contents) {
+    throw new InsoError(`Specification content not found using API spec id: "${identifier}" in "${pathToSearch}"`);
+  }
+  return specFromDb.contents;
+};
+const getWorkspaceOrFallback = async (db: Database, identifier: string, ci: boolean) => {
+  if (identifier) {
+    return loadWorkspace(db, identifier);
+  }
+  if (ci && db.Workspace.length > 0) {
+    return db.Workspace[0];
+  }
+  return await promptWorkspace(db, !!ci);
+};
+const getRequestsToRunFromListOrWorkspace = (db: Database, workspaceId: string, item: string[]): Request[] => {
+  const getRequestGroupIdsRecursively = (from: string[]): string[] => {
+    const parentIds = db.RequestGroup.filter(rg => from.includes(rg.parentId)).map(rg => rg._id);
+    return [...parentIds, ...(parentIds.length > 0 ? getRequestGroupIdsRecursively(parentIds) : [])];
+  };
+  const hasItems = item.length > 0;
+  if (hasItems) {
+    const folderIds = item.filter(id => db.RequestGroup.find(rg => rg._id === id));
+    const allRequestGroupIds = [...folderIds, ...getRequestGroupIdsRecursively(folderIds)];
+    const folderRequests = db.Request.filter(req => allRequestGroupIds.includes(req.parentId)) as Request[];
+    const reqItems = db.Request.filter(req => item.includes(req._id)) as Request[];
+
+    return [...reqItems, ...folderRequests];
+  }
+
+  const allRequestGroupIds = getRequestGroupIdsRecursively([workspaceId]);
+  return db.Request.filter(req => [workspaceId, ...allRequestGroupIds].includes(req.parentId)) as Request[];
+};
+// adds support for repeating args in commander.js eg. -i 1 -i 2 -i 3
+const collect = (val: string, memo: string[]) => {
+  memo.push(val);
+  return memo;
+};
+const readFileFromPathOrUrl = async (pathOrUrl: string) => {
+  if (!pathOrUrl) {
+    return '';
+  }
+  if (pathOrUrl.startsWith('http')) {
+    const response = await fetch(pathOrUrl);
+    return response.text();
+  }
+  return readFile(pathOrUrl, 'utf8');
+};
+const pathToIterationData = async (pathOrUrl: string, env: string[]): Promise<UserUploadEnvironment[]> => {
+  const envAsObject = env
+    .map(envString => Object.fromEntries(new URLSearchParams(envString).entries()))
+    .reduce((acc, obj) => ({ ...acc, ...obj }), {});
+  const fileType = pathOrUrl.split('.').pop()?.toLowerCase();
+  const content = await readFileFromPathOrUrl(pathOrUrl);
+  if (!content) {
+    return transformIterationDataToEnvironmentList([envAsObject]);
+  }
+  const list = getListFromFileOrUrl(content, fileType).map(data => ({ ...data, ...envAsObject }));
+  return transformIterationDataToEnvironmentList(list);
+};
+const getListFromFileOrUrl = (content: string, fileType?: string): Record<string, string>[] => {
+  if (fileType === 'json') {
+    try {
+      const jsonDataContent = JSON.parse(content);
+      if (Array.isArray(jsonDataContent)) {
+        return jsonDataContent.filter(
+          data => data && typeof data === 'object' && !Array.isArray(data) && data !== null,
+        );
+      }
+      throw new Error('Invalid JSON file uploaded, JSON file must be array of key-value pairs.');
+    } catch {
+      throw new Error('Upload JSON file can not be parsed');
+    }
+  } else if (fileType === 'csv') {
+    // Replace CRLF (Windows line break) and CR (Mac link break) with \n, then split into csv arrays
+    const csvRows = content
+      .replace(/\r\n|\r/g, '\n')
+      .split('\n')
+      .map(row => row.split(','));
+    // at least 2 rows required for csv
+    if (csvRows.length > 1) {
+      const csvHeaders = csvRows[0];
+      const csvContentRows = csvRows.slice(1);
+      return csvContentRows.map(contentRow =>
+        csvHeaders.reduce((acc: Record<string, any>, cur, idx) => {
+          acc[cur] = contentRow[idx] ?? '';
+          return acc;
+        }, {}),
+      );
+    }
+    throw new Error('CSV file must contain at least two rows with first row as variable names');
+  }
+  throw new Error(`Uploaded file is unsupported ${fileType}`);
+};
+
+const transformIterationDataToEnvironmentList = (list: Record<string, string>[]): UserUploadEnvironment[] => {
+  return list?.map(data => {
+    const orderedJson = orderedJSON.parse<Record<string, any>>(
+      JSON.stringify(data || []),
+      JSON_ORDER_PREFIX,
+      JSON_ORDER_SEPARATOR,
+    );
+    return {
+      name: 'User Upload',
+      data: orderedJson.object,
+      dataPropertyOrder: orderedJson.map || null,
+    };
+  });
+};
+
+export const go = (args?: string[]) => {
+  const program = new commander.Command();
+  const version = process.env.VERSION || packageJson.version;
+
+  const proxySettings: {
+    proxyEnabled: boolean;
+    httpProxy: string;
+    httpsProxy: string;
+    noProxy: string;
+  } = {
+    proxyEnabled: false,
+    httpProxy: '',
+    httpsProxy: '',
+    noProxy: '',
+  };
+
+  if (process.env.HTTP_PROXY || process.env.HTTPS_PROXY || process.env.http_proxy || process.env.https_proxy) {
+    proxySettings.proxyEnabled = true;
+    proxySettings.httpProxy = process.env.HTTP_PROXY || process.env.http_proxy || '';
+    proxySettings.httpsProxy = process.env.HTTPS_PROXY || process.env.https_proxy || '';
+    proxySettings.noProxy = process.env.NO_PROXY || process.env.no_proxy || '';
+  }
+
+  // Merge global options, config file options, and command options
+  // Initialize logger
+  const mergeOptionsAndInit = async <T extends Record<string, any>>(
+    cmd: T,
+  ): Promise<
+    GlobalOptions &
+      T & {
+        configFileContent: Awaited<ReturnType<typeof tryToReadInsoConfigFile>>;
+      }
+  > => {
+    const globals: GlobalOptions = program.optsWithGlobals();
+
+    const commandOptions = { ...globals, ...cmd };
+    const __configFile = await tryToReadInsoConfigFile(commandOptions.config, commandOptions.workingDir);
+
+    const options = {
+      ...__configFile?.options,
+      ...commandOptions,
+      configFileContent: __configFile,
+    };
+    logger.level = options.verbose ? LogLevel.Verbose : LogLevel.Info;
+    options.ci && logger.setReporters([new BasicReporter()]);
+    options.printOptions && logger.log('Loaded options', options, '\n');
+
+    return options;
+  };
+
+  // export and lint logic
+  // Provide a path to a file which looks like an insomnia db
+  // it may contain multiple workspaces, and specs.
+  // you can also just provide a spec file
+  // things get confusing when you might have a workingDir and an identifier, since they can all be paths to a spec file
+
+  // differences
+  // lint can read a .spectral.yml from the folder provided
+  // export can remove annotations and output to a file
+
+  program
+    .version(version, '-v, --version')
+    .description(
+      `A CLI for Iusomnia!
+  With this tool you can test, lint, and export your Iusomnia data.
+  Inso will try to detect your locally installed Iusomnia data.
+  You can also point it at a git repository folder, or an Iusomnia export file.
+
+  Examples:
+  $ inso run collection
+  $ inso run test
+  $ inso lint spec
+  $ inso export spec
+
+
+  Inso also supports configuration files, by default it will look for .insorc in the current/provided working directory.
+  $ inso export spec --config /some/path/.insorc
+`,
+    )
+    .option('-w, --workingDir <dir>', 'set working directory/file: .insomnia folder, *.db.json, export.yaml', '')
+    .option('--verbose', 'show additional logs while running the command', false)
+    .option('--ci', 'run in CI, disables all prompts, defaults to false', false)
+    .option('--config <path>', 'path to configuration file containing above options (.insorc)', '')
+    .option('--printOptions', 'print the loaded options', false);
+
+  const run = program.command('run').description('Execution utilities');
+
+  const defaultReporter: TestReporter = 'spec';
+  run
+    .command('test [identifier]')
+    .description('Run Iusomnia unit test suites, identifier can be a test suite id or a API Spec id')
+    .option('-e, --env <identifier>', 'environment to use', '')
+    .option('-t, --testNamePattern <regex>', 'run tests that match the regex', '')
+    .option('-r, --reporter <reporter>', `reporter to use, options are [${reporterTypes.join(', ')}]`, defaultReporter)
+    .option('-b, --bail', 'abort ("bail") after first test failure', false)
+    .option('--keepFile', 'do not delete the generated test file', false)
+    .option('--requestTimeout <duration>', 'milliseconds before request times out') // defaults to user settings
+    .option('-k, --disableCertValidation', 'disable certificate validation for requests with SSL', false)
+    .option('--httpsProxy <proxy>', 'URL for the proxy server for https requests.', proxySettings.httpsProxy)
+    .option('--httpProxy <proxy>', 'URL for the proxy server for http requests.', proxySettings.httpProxy)
+    .option(
+      '--noProxy <comma_separated_list_of_hostnames>',
+      'Comma separated list of hostnames that do not require a proxy to get reached, even if one is specified.',
+      proxySettings.noProxy,
+    )
+    .option(
+      '-f, --dataFolders [dataFolders...]',
+      'This allows you to control what folders Iusomnia (and scripts within Iusomnia) can read/write to.',
+      [],
+    )
+    .action(
+      async (
+        identifier,
+        cmd: {
+          env: string;
+          testNamePattern: string;
+          reporter: TestReporter;
+          bail: boolean;
+          keepFile: boolean;
+          disableCertValidation: boolean;
+          ci: boolean;
+          httpsProxy?: string;
+          httpProxy?: string;
+          noProxy?: string;
+          dataFolders: string[];
+          requestTimeout?: string;
+        },
+      ) => {
+        const options = await mergeOptionsAndInit(cmd);
+
+        const pathToSearch = getWorkingDir(options);
+
+        if (options.reporter && !reporterTypes.find(r => r === options.reporter)) {
+          logger.fatal(`Reporter "${options.reporter}" not unrecognized. Options are [${reporterTypes.join(', ')}].`);
+          return process.exit(1);
+        }
+
+        const db = await loadDb({
+          pathToSearch,
+          filterTypes: [],
+        });
+
+        // Find suites
+        const suites = identifier ? loadTestSuites(db, identifier) : await promptTestSuites(db, !!options.ci);
+
+        if (!suites.length) {
+          logger.fatal('No test suites found; cannot run tests.', identifier);
+          return process.exit(1);
+        }
+
+        // Find environment
+        const workspaceId = suites[0].parentId;
+
+        const environment = options.env
+          ? loadEnvironment(db, workspaceId, options.env)
+          : await promptEnvironment(db, !!options.ci, workspaceId);
+
+        if (!environment) {
+          logger.fatal('No environment identified; cannot run tests without a valid environment.');
+          return process.exit(1);
+        }
+
+        const transientVariables: Environment = {
+          ...models.environment.init(),
+          _id: uuidv4(),
+          type: 'Environment',
+          parentId: '',
+          modified: 0,
+          created: Date.now(),
+          name: 'Transient Variables',
+          data: {},
+        };
+
+        const proxyOptions: {
+          proxyEnabled: boolean;
+          httpProxy?: string;
+          httpsProxy?: string;
+          noProxy?: string;
+        } = {
+          proxyEnabled: Boolean(options.httpProxy || options.httpsProxy),
+          httpProxy: options.httpProxy,
+          httpsProxy: options.httpsProxy,
+          noProxy: options.noProxy,
+        };
+
+        try {
+          const sendRequest = await getSendRequestCallbackMemDb(environment._id, db, transientVariables, {
+            validateSSL: !options.disableCertValidation,
+            ...proxyOptions,
+            dataFolders: options.dataFolders,
+            ...(options.requestTimeout ? { timeout: Number.parseInt(options.requestTimeout, 10) } : {}),
+          });
+          // Generate test file
+          const testFileContents = generate(
+            suites.map(suite => ({
+              name: suite.name,
+              suites: [],
+              tests: db.UnitTest.filter(test => test.parentId === suite._id)
+                .sort((a, b) => a.metaSortKey - b.metaSortKey)
+                .map(({ name, code, requestId }) => ({ name, code, defaultRequestId: requestId })),
+            })),
+          );
+
+          const runTestPromise = runTestsCli(testFileContents, {
+            reporter: options.reporter,
+            bail: options.bail,
+            keepFile: options.keepFile,
+            sendRequest,
+            testFilter: options.testNamePattern,
+          });
+
+          // TODO: is this necessary?
+          const success = options.verbose ? await runTestPromise : await noConsoleLog(() => runTestPromise);
+
+          await trackInsoEvent(InsoEvent.runTest, { success });
+          await flushAnalytics();
+
+          return process.exit(success ? 0 : 1);
+        } catch (error) {
+          await trackInsoEvent(InsoEvent.runTest, { success: false });
+          await flushAnalytics();
+
+          logErrorAndExit(error);
+        }
+        return process.exit(1);
+      },
+    );
+
+  run
+    .command('collection [identifier]')
+    .description('Run Iusomnia request collection, identifier can be a workspace id')
+    .option('-t, --requestNamePattern <regex>', 'run requests that match the regex', '')
+    .option('-i, --item <requestid>', 'request or folder id to run', collect, [])
+    .option('-e, --env <identifier>', 'environment to use', '')
+    .option('-g, --globals <identifier>', 'global environment to use (filepath or id)', '')
+    .option('--delay-request <duration>', 'milliseconds to delay between requests', '0')
+    .option('--requestTimeout <duration>', 'milliseconds before request times out') // defaults to user settings
+    .option('--env-var <key=value>', 'override environment variables', collect, [])
+    .option('-n, --iteration-count <count>', 'number of times to repeat', '1')
+    .option('-d, --iteration-data <path/url>', 'file path or url (JSON or CSV)', '')
+    .option('-r, --reporter <reporter>', `reporter to use, options are [${reporterTypes.join(', ')}]`, defaultReporter)
+    .option('-b, --bail', 'abort ("bail") after first non-200 response', false)
+    .option('--disableCertValidation', 'disable certificate validation for requests with SSL', false)
+    .option('--httpsProxy <proxy>', 'URL for the proxy server for https requests.', proxySettings.httpsProxy)
+    .option('--httpProxy <proxy>', 'URL for the proxy server for http requests.', proxySettings.httpProxy)
+    .option(
+      '--noProxy <comma_separated_list_of_hostnames>',
+      'Comma separated list of hostnames that do not require a proxy to get reached, even if one is specified.',
+      proxySettings.noProxy,
+    )
+    .option(
+      '-f, --dataFolders [dataFolders...]',
+      'This allows you to control what folders Iusomnia (and scripts within Iusomnia) can read/write to.',
+      [],
+    )
+    .option('--output <file>', 'Output the results to a file in JSON format.')
+    .addOption(
+      new commander.Option(
+        '--includeFullData <type>',
+        'Include full data in the output file, including request, response, environment and etc.',
+      ).choices(['redact', 'plaintext']),
+    )
+    .option(
+      '--acceptRisk',
+      'Accept the security warning when outputting to a file, please make sure you understand the risks.',
+      false,
+    )
+    .action(
+      async (
+        identifier,
+        cmd: {
+          env: string;
+          globals: string;
+          disableCertValidation: boolean;
+          requestNamePattern: string;
+          bail: boolean;
+          item: string[];
+          delayRequest: string;
+          iterationCount: string;
+          iterationData: string;
+          envVar: string[];
+          httpsProxy?: string;
+          httpProxy?: string;
+          noProxy?: string;
+          reporter: TestReporter;
+          dataFolders: string[];
+          output?: string;
+          includeFullData?: 'redact' | 'plaintext';
+          acceptRisk: boolean;
+          requestTimeout?: string;
+        },
+      ) => {
+        const options = await mergeOptionsAndInit(cmd);
+
+        let outputFilePath = '';
+        // Check if the output file is a writable file if it exists
+        if (options.output) {
+          outputFilePath = getAbsoluteFilePath({ workingDir: options.workingDir, file: options.output });
+          if (fs.existsSync(outputFilePath)) {
+            const stats = fs.statSync(outputFilePath);
+            if (!stats.isFile()) {
+              logger.fatal(`Output path "${outputFilePath}" is not a file.`);
+              return process.exit(1);
+            }
+            try {
+              fs.accessSync(outputFilePath, fs.constants.W_OK);
+            } catch {
+              logger.fatal(`Output file "${outputFilePath}" is not writable.`);
+              return process.exit(1);
+            }
+          }
+
+          // Show security disclaimer when outputting to a file with data
+          if (options.includeFullData && !options.acceptRisk) {
+            const disclaimerMessage = [
+              'SECURITY WARNING',
+              'Outputting to a file could contain sensitive data like API tokens or secrets. Make sure you understand this, and the contents of your collection, before proceeding.',
+              'Are you sure you want to continue?',
+            ].join('\n');
+
+            const acceptDisclaimer = await new Confirm({ message: disclaimerMessage, initial: false }).run();
+
+            if (!acceptDisclaimer) {
+              logger.fatal('User did not accept the disclaimer, aborting.');
+              return process.exit(1);
+            }
+          }
+        }
+
+        const report = new RunCollectionResultReport(
+          {
+            outputFilePath,
+            includeFullData: options.includeFullData,
+          },
+          logger,
+        );
+
+        const pathToSearch = getWorkingDir(options);
+        const db = await loadDb({
+          pathToSearch,
+          filterTypes: [],
+        });
+
+        const workspace = await getWorkspaceOrFallback(db, identifier, options.ci);
+        if (!workspace) {
+          logger.fatal('No workspace found in the provided data store or fallbacks.');
+          return process.exit(1);
+        }
+
+        report.update({ collection: workspace as Workspace });
+
+        // Find environment
+        const workspaceId = workspace._id;
+        // get global env by id from nedb or gitstore, or first element from file
+        // smell: mutates db
+        if (options.globals) {
+          const isGlobalFile = await isFile(options.globals);
+          if (!isGlobalFile) {
+            const globalEnv = db.Environment.find(
+              env => matchIdIsh(env, options.globals) || env.name === options.globals,
+            );
+            if (!globalEnv) {
+              logger.warn(
+                `Error: No global environment found with ID or name "${options.globals}".
+  TIP: If you're running "inso" inside a Git project, specify the path to the Iusomnia YAML file containing the global environment using the "--globals" option.
+  
+  Example:
+    $ inso run collection --globals /path/to/global-environment.yaml
+                `,
+              );
+              return process.exit(1);
+            }
+            if (globalEnv) {
+              // attach this global env to the workspace
+              db.WorkspaceMeta = [
+                {
+                  activeGlobalEnvironmentId: globalEnv._id,
+                  _id: `wrkm_${uuidv4().replace(/-/g, '')}`,
+                  type: 'WorkspaceMeta',
+                  parentId: workspaceId,
+                  name: '',
+                },
+              ];
+            }
+          }
+          if (isGlobalFile) {
+            const globalEnvDb = await insomniaExportAdapter(options.globals, ['Environment']);
+            logger.trace(
+              '--globals is a file path, loading from file, global env selection is not currently supported, taking first element',
+            );
+            const firstGlobalEnv = globalEnvDb?.Environment?.[0];
+            if (!firstGlobalEnv) {
+              logger.warn('No environments found in the file', options.globals);
+              return process.exit(1);
+            }
+            // mutate db to include the global envs
+            db.Environment = [...db.Environment, ...globalEnvDb.Environment];
+            // attach this global env to the workspace
+            db.WorkspaceMeta = [
+              {
+                activeGlobalEnvironmentId: firstGlobalEnv._id,
+                _id: `wrkm_${uuidv4().replace(/-/g, '')}`,
+                type: 'WorkspaceMeta',
+                parentId: workspaceId,
+                name: '',
+              },
+            ];
+          }
+        }
+        const environment = options.env
+          ? loadEnvironment(db, workspaceId, options.env)
+          : await promptEnvironment(db, !!options.ci, workspaceId);
+        if (!environment) {
+          logger.fatal('No environment identified; cannot run requests without a valid environment.');
+          return process.exit(1);
+        }
+
+        report.update({ environment: environment as Environment });
+
+        let requestsToRun = getRequestsToRunFromListOrWorkspace(db, workspaceId, options.item);
+        if (options.requestNamePattern) {
+          requestsToRun = requestsToRun.filter(req => req.name.match(new RegExp(options.requestNamePattern)));
+        }
+        if (!requestsToRun.length) {
+          logger.fatal('No requests identified; nothing to run.');
+          return process.exit(1);
+        }
+
+        // sort requests
+        const isRunningFolder = options.item.length === 1 && options.item[0].startsWith('fld_');
+        if (options.item.length && !isRunningFolder) {
+          const requestOrder = new Map<string, number>();
+          options.item.forEach((reqId: string, order: number) => {
+            requestOrder.set(reqId, order + 1);
+          });
+          requestsToRun = requestsToRun.sort(
+            (a, b) =>
+              (requestOrder.get(a._id) || requestsToRun.length) - (requestOrder.get(b._id) || requestsToRun.length),
+          );
+        } else {
+          const getAllParentGroupSortKeys = (doc: BaseModel): number[] => {
+            const parentFolder = db.RequestGroup.find(rg => rg._id === doc.parentId);
+            if (parentFolder === undefined) {
+              return [];
+            }
+            return [(parentFolder as RequestGroup).metaSortKey, ...getAllParentGroupSortKeys(parentFolder)];
+          };
+
+          // sort by metaSortKey (manual sorting order)
+          requestsToRun = requestsToRun
+            .map(request => {
+              const allParentGroupSortKeys = getAllParentGroupSortKeys(request as BaseModel);
+
+              return {
+                ancestors: allParentGroupSortKeys.reverse(),
+                request,
+              };
+            })
+            .sort((a, b) => {
+              let compareResult = 0;
+
+              let i = 0,
+                j = 0;
+              for (; i < a.ancestors.length && j < b.ancestors.length; i++, j++) {
+                const aSortKey = a.ancestors[i];
+                const bSortKey = b.ancestors[j];
+                if (aSortKey < bSortKey) {
+                  compareResult = -1;
+                  break;
+                } else if (aSortKey > bSortKey) {
+                  compareResult = 1;
+                  break;
+                }
+              }
+              if (compareResult !== 0) {
+                return compareResult;
+              }
+
+              if (a.ancestors.length === b.ancestors.length) {
+                return a.request.metaSortKey - b.request.metaSortKey;
+              }
+
+              if (i < a.ancestors.length) {
+                return a.ancestors[i] - b.request.metaSortKey;
+              } else if (j < b.ancestors.length) {
+                return a.request.metaSortKey - b.ancestors[j];
+              }
+              return 0;
+            })
+            .map(({ request }) => request);
+        }
+
+        try {
+          const iterationCount = Number.parseInt(options.iterationCount, 10);
+
+          const iterationData = await pathToIterationData(options.iterationData, options.envVar);
+          const transientVariables: Environment = {
+            ...models.environment.init(),
+            _id: uuidv4(),
+            type: 'Environment',
+            parentId: '',
+            modified: 0,
+            created: Date.now(),
+            name: 'Transient Variables',
+            data: {},
+          };
+
+          const proxyOptions: {
+            proxyEnabled: boolean;
+            httpProxy?: string;
+            httpsProxy?: string;
+            noProxy?: string;
+          } = {
+            proxyEnabled: Boolean(options.httpProxy || options.httpsProxy),
+            httpProxy: options.httpProxy,
+            httpsProxy: options.httpsProxy,
+            noProxy: options.noProxy,
+          };
+
+          report.update({
+            proxy: proxyOptions,
+            iterationCount,
+            iterationData,
+            startedAt: Date.now(),
+          });
+
+          const sendRequest = await getSendRequestCallbackMemDb(
+            environment._id,
+            db,
+            transientVariables,
+            {
+              validateSSL: !options.disableCertValidation,
+              ...proxyOptions,
+              dataFolders: options.dataFolders,
+              ...(options.requestTimeout ? { timeout: Number.parseInt(options.requestTimeout, 10) } : {}),
+            },
+            iterationData,
+            iterationCount,
+          );
+          let success = true;
+
+          const testResultsQueue: RequestTestResult[][] = [];
+          for (let i = 0; i < iterationCount; i++) {
+            let reqIndex = 0;
+            while (reqIndex < requestsToRun.length) {
+              const req = requestsToRun[reqIndex];
+
+              if (options.bail && !success) {
+                return;
+              }
+              logger.log(`Running request: ${req.name} ${req._id}`);
+              const res = await sendRequest(req._id, i);
+              if (!res) {
+                logger.error('Timed out while running script');
+                success = false;
+                continue;
+              }
+
+              report.addExecution({
+                request: req,
+                response: {
+                  status: res.statusMessage,
+                  code: res.status,
+                  headers: res.headers,
+                  data: res.data,
+                  responseTime: res.responseTime,
+                },
+                // TODO: Remove the category field from test results since it is not needed in the report and is always incorrect as unknown.
+                tests: res.testResults.map(t => pick(t, ['testCase', 'status', 'executionTime', 'errorMessage'])),
+                iteration: i,
+                success,
+              });
+
+              const timelineString = await readFile(res.timelinePath, 'utf8');
+              const appendNewLineIfNeeded = (str: string) => (str.endsWith('\n') ? str : str + '\n');
+              const timeline = deserializeNDJSON(timelineString)
+                .map(e => appendNewLineIfNeeded(e.value))
+                .join('');
+              logger.trace(timeline);
+
+              if (res.testResults?.length) {
+                testResultsQueue.push(res.testResults);
+                logTestResult(options.reporter, res.testResults);
+                const hasFailedTests = res.testResults.some(t => t.status === 'failed');
+                if (hasFailedTests) {
+                  success = false;
+                }
+              }
+
+              await new Promise(r => setTimeout(r, Number.parseInt(options.delayRequest, 10)));
+
+              if (res.nextRequestIdOrName) {
+                const offset = getNextRequestOffset(requestsToRun.slice(reqIndex), res.nextRequestIdOrName);
+                reqIndex += offset;
+                if (reqIndex < requestsToRun.length) {
+                  console.log(`The next request has been pointed to "${requestsToRun[reqIndex].name}"`);
+                } else {
+                  console.log(`No request has been found for "${res.nextRequestIdOrName}", ending the iteration`);
+                }
+              } else {
+                reqIndex++;
+              }
+            }
+          }
+
+          logTestResultSummary(testResultsQueue);
+
+          await report.saveReport();
+
+          await trackInsoEvent(InsoEvent.runCollection, { success });
+          await flushAnalytics();
+
+          return process.exit(success ? 0 : 1);
+        } catch (error) {
+          report.update({ error: (error instanceof Error ? error.message : String(error)) || 'Unknown error' });
+          await report.saveReport();
+
+          await trackInsoEvent(InsoEvent.runCollection, { success: false });
+          await flushAnalytics();
+
+          logErrorAndExit(error);
+        }
+        return process.exit(1);
+      },
+    );
+
+  program
+    .command('lint')
+    .description(
+      'Lint a yaml file in the workingDir or the provided file path (with  .spectral.yml) or a spec in an Iusomnia database directory',
+    )
+    .command('spec [identifier]')
+    .description('Lint an API Specification, identifier can be an API Spec id or a file path')
+    .action(async identifier => {
+      const options = await mergeOptionsAndInit({});
+
+      // Assert identifier is a file
+      const identifierAsAbsPath =
+        identifier && getAbsoluteFilePath({ workingDir: options.workingDir, file: identifier });
+      let isIdentifierAFile = false;
+      try {
+        isIdentifierAFile = identifier && (await fs.promises.stat(identifierAsAbsPath)).isFile();
+      } catch {}
+      const pathToSearch = '';
+      let specContent: string | undefined;
+      let rulesetFileName: string | undefined;
+      if (isIdentifierAFile) {
+        // try load as a file
+        logger.trace(`Linting specification file from identifier: \`${identifierAsAbsPath}\``);
+        specContent = await fs.promises.readFile(identifierAsAbsPath, 'utf8');
+        rulesetFileName = await getRuleSetFileFromFolderByFilename(identifierAsAbsPath);
+        if (!specContent) {
+          logger.fatal(`Specification content not found using path: ${identifier} in ${identifierAsAbsPath}`);
+          return process.exit(1);
+        }
+      }
+      if (!isIdentifierAFile) {
+        try {
+          specContent = await resolveSpecInDatabase(identifier, options);
+        } catch (err) {
+          logErrorAndExit(err);
+        }
+      }
+
+      if (!specContent) {
+        logger.fatal('Specification content not found at: ' + pathToSearch);
+        return process.exit(1);
+      }
+
+      try {
+        const { isValid } = await lintSpecification({ specContent, rulesetFileName });
+
+        await trackInsoEvent(InsoEvent.lintSpec, { success: isValid });
+        await flushAnalytics();
+
+        return process.exit(isValid ? 0 : 1);
+      } catch (error) {
+        await trackInsoEvent(InsoEvent.lintSpec, { success: false });
+        await flushAnalytics();
+
+        logErrorAndExit(error);
+      }
+      return process.exit(1);
+    });
+
+  program
+    .command('export')
+    .description('Export data from insomnia models')
+    .command('spec [identifier]')
+    .description('Export an API Specification to a file, identifier can be an API Spec id')
+    .option('-o, --output <path>', 'save the generated config to a file', '')
+    .option('-s, --skipAnnotations', 'remove all "x-kong-" annotations, defaults to false', false)
+    .action(async (identifier, cmd: { output: string; skipAnnotations: boolean }) => {
+      const options = await mergeOptionsAndInit(cmd);
+
+      let specContent = '';
+      try {
+        specContent = await resolveSpecInDatabase(identifier, options);
+      } catch (err) {
+        logErrorAndExit(err);
+      }
+      try {
+        const toExport = await exportSpecification({
+          specContent,
+          skipAnnotations: options.skipAnnotations,
+        });
+        const outputPath =
+          options.output && getAbsoluteFilePath({ workingDir: options.workingDir, file: options.output });
+        if (!outputPath) {
+          logger.log(toExport);
+
+          await trackInsoEvent(InsoEvent.exportSpec, { success: true });
+          await flushAnalytics();
+
+          return process.exit(0);
+        }
+        const filePath = await writeFileWithCliOptions(outputPath, toExport);
+        logger.log(`Specification exported to "${filePath}".`);
+
+        await trackInsoEvent(InsoEvent.exportSpec, { success: true });
+        await flushAnalytics();
+
+        return process.exit(0);
+      } catch (error) {
+        await trackInsoEvent(InsoEvent.exportSpec, { success: false });
+        await flushAnalytics();
+
+        logErrorAndExit(error);
+      }
+      return process.exit(1);
+    });
+
+  // Add script base command
+  program
+    .command('script <script-name>')
+    .description('Run scripts defined in .insorc')
+    .allowUnknownOption()
+    .action(async (scriptName: string, cmd) => {
+      const options = await mergeOptionsAndInit(cmd);
+
+      const scriptTask = options.configFileContent?.scripts?.[scriptName];
+
+      if (!scriptTask) {
+        logger.fatal(
+          `Could not find inso script "${scriptName}" in the config file.`,
+          Object.keys(options.configFileContent?.scripts || {}),
+        );
+        return process.exit(1);
+      }
+
+      if (!scriptTask.startsWith('inso')) {
+        logger.fatal('Tasks in a script should start with `inso`.');
+        return process.exit(1);
+      }
+
+      // Get args after script name
+      const passThroughArgs = program.args.slice(program.args.indexOf(scriptName) + 1);
+      const scriptArgs: string[] = parseArgsStringToArgv(`self ${scriptTask} ${passThroughArgs.join(' ')}`);
+
+      logger.debug(`>> ${scriptArgs.slice(1).join(' ')}`);
+
+      // Track script invocation - the underlying command will track its own success/failure
+      await trackInsoEvent(InsoEvent.script);
+
+      program.parseAsync(scriptArgs).catch(logErrorAndExit);
+    });
+
+  program.command('generate-docs').action(() => {
+    generateDocumentation(program);
+    return process.exit(1);
+  });
+
+  program.parseAsync(args || process.argv).catch(logErrorAndExit);
+};
+
+const getNextRequestOffset = (leftRequestsToRun: Request[], nextRequestIdOrName: string) => {
+  const idMatchOffset = leftRequestsToRun.findIndex(req => req._id.trim() === nextRequestIdOrName.trim());
+  if (idMatchOffset !== -1) {
+    return idMatchOffset;
+  }
+
+  const nameMatchOffset = leftRequestsToRun.reverse().findIndex(req => req.name.trim() === nextRequestIdOrName.trim());
+  if (nameMatchOffset !== -1) {
+    return leftRequestsToRun.length - 1 - nameMatchOffset;
+  }
+
+  return leftRequestsToRun.length;
+};

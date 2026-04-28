@@ -1,0 +1,283 @@
+import React, { useEffect, useState } from 'react';
+import {
+  Button,
+  Cell,
+  Column,
+  Dialog,
+  FileTrigger,
+  Heading,
+  Modal,
+  ModalOverlay,
+  Row,
+  Table,
+  TableBody,
+  TableHeader,
+} from 'react-aria-components';
+
+import { useI18n } from '~/ui/i18n';
+
+import { EncodingPicker } from '../encoding-picker';
+import { Icon } from '../icon';
+
+export type UploadDataType = Record<string, any>;
+export interface UploadDataModalProps {
+  onUploadFile: (file: File | null, data: UploadDataType[]) => void;
+  onClose: () => void;
+  userUploadData: UploadDataType[];
+}
+
+const rowHeaderStyle =
+  'sticky normal-case top-[-8px] p-2 z-10 border-b border-(--hl-sm) bg-(--hl-xs) text-left text-xs font-semibold backdrop-blur-sm backdrop-filter focus:outline-hidden';
+const rowCellStyle =
+  'whitespace-nowrap text-sm font-medium border-b border-solid border-(--hl-sm) group-last-of-type:border-none focus:outline-hidden';
+const supportedFileTypes = ['application/json', 'text/csv'];
+
+export const genPreviewTableData = (uploadData: UploadDataType[]) => {
+  // generate header and body data for preview table from upload data
+  let dataHeaders: string[] = [];
+  const filteredUploadData: UploadDataType[] = uploadData.filter(data => {
+    const isObjectData = data && typeof data === 'object' && !Array.isArray(data) && data !== null;
+    if (isObjectData) {
+      dataHeaders = dataHeaders.concat(Object.keys(data));
+    }
+    return isObjectData;
+  });
+  // dedup data headers
+  const uniqueDataHeaders = [...new Set(dataHeaders)];
+  return { data: filteredUploadData, headers: uniqueDataHeaders };
+};
+
+export const UploadDataModal = ({ onUploadFile, onClose, userUploadData }: UploadDataModalProps) => {
+  const { t } = useI18n();
+  const [file, setUploadFile] = useState<File | null>(null);
+  const [uploadDataHeaders, setUploadDataHeaders] = useState<string[]>([]);
+  const [uploadData, setUploadData] = useState<UploadDataType[]>([]);
+  const [fileEncoding, setFileEncoding] = useState('');
+  const [invalidFileReason, setInvalidFileReason] = useState('');
+
+  const parseFileContent = (content: string, fileType: string) => {
+    try {
+      if (fileType === 'application/json') {
+        try {
+          const jsonDataContent = JSON.parse(content);
+          if (Array.isArray(jsonDataContent)) {
+            const { data, headers } = genPreviewTableData(jsonDataContent);
+            if (headers.length > 0 && data.length > 0) {
+              setUploadDataHeaders(headers);
+              setUploadData(data);
+            } else {
+              setInvalidFileReason(t('modals.invalidJsonNoKeyValuePair'));
+            }
+          } else {
+            setInvalidFileReason(t('modals.invalidJsonMustBeArray'));
+          }
+        } catch {
+          setInvalidFileReason(t('modals.uploadJsonCannotBeParsed'));
+        }
+      } else if (fileType === 'text/csv') {
+        // Replace CRLF (Windows line break) and CR (Mac link break) with \n, then split into csv arrays
+        const csvRows = content
+          .replace(/\r\n|\r/g, '\n')
+          .split('\n')
+          .map(row => row.split(','));
+        // at least 2 rows required for csv
+        if (csvRows.length > 1) {
+          const csvHeaders = csvRows[0];
+          const csvContentRows = csvRows.slice(1);
+          const uploadData = csvContentRows.map(contentRow =>
+            csvHeaders.reduce((acc: UploadDataType, cur, idx) => {
+              acc[cur] = contentRow[idx] ?? '';
+              return acc;
+            }, {}),
+          );
+          setUploadDataHeaders(csvHeaders);
+          setUploadData(uploadData);
+        } else {
+          setInvalidFileReason(t('modals.csvMustContainTwoRows'));
+        }
+      }
+    } catch (error) {
+      setInvalidFileReason(t('modals.failedToReadFile', { message: error?.message || '' }));
+    }
+  };
+
+  const handleFileSelect = async (fileList: FileList | null) => {
+    setInvalidFileReason('');
+    setUploadData([]);
+    if (!fileList) {
+      return;
+    }
+    const files = Array.from(fileList);
+    const file = files[0];
+    const fileType = file.type;
+    if (!supportedFileTypes.includes(fileType)) {
+      setInvalidFileReason(t('modals.uploadedFileUnsupported', { fileType: file.type }));
+      return;
+    }
+    const filePath = window.webUtils.getPathForFile(file);
+    try {
+      const { content, encoding } = await window.main.insecureReadFileWithEncoding({ path: filePath });
+      setFileEncoding(encoding);
+      parseFileContent(content, fileType);
+    } catch (error) {
+      setInvalidFileReason(t('modals.failedToReadFile', { message: error?.message || '' }));
+      return;
+    }
+    setUploadFile(file);
+  };
+
+  const handleEncodingChange = async (newEncoding: string) => {
+    setFileEncoding(newEncoding);
+    setInvalidFileReason('');
+    if (file) {
+      const filePath = window.webUtils.getPathForFile(file);
+      const fileType = file.type;
+      try {
+        const { content } = await window.main.insecureReadFileWithEncoding({
+          path: filePath,
+          encoding: newEncoding,
+        });
+        parseFileContent(content, fileType);
+      } catch (error) {
+        setInvalidFileReason(t('modals.failedToReadFile', { message: error?.message || '' }));
+      }
+    }
+  };
+
+  const handleUploadData = () => {
+    if (file && uploadData.length >= 1) {
+      onUploadFile(file, uploadData);
+    }
+    onClose();
+  };
+
+  const handleClearData = () => {
+    onUploadFile(null, []);
+    onClose();
+  };
+
+  useEffect(() => {
+    if (userUploadData.length > 0) {
+      const { data, headers } = genPreviewTableData(userUploadData);
+      setUploadDataHeaders(headers);
+      setUploadData(data);
+    }
+  }, [userUploadData]);
+
+  return (
+    <ModalOverlay
+      isOpen
+      isDismissable
+      onOpenChange={isOpen => {
+        !isOpen && onClose();
+      }}
+      className="fixed top-0 left-0 z-10 flex h-(--visual-viewport-height) w-full items-start justify-center bg-black/30"
+    >
+      <Modal
+        className="m-24 flex max-h-[75%] w-full max-w-3xl flex-col overflow-auto rounded-md border border-solid border-(--hl-sm) bg-(--color-bg) p-(--padding-lg) text-(--color-font)"
+        onOpenChange={isOpen => {
+          !isOpen && onClose();
+        }}
+      >
+        <Dialog className="flex h-full flex-1 flex-col overflow-hidden outline-hidden">
+          {({ close }) => (
+            <div className="flex flex-1 flex-col gap-4 overflow-hidden">
+              <div className="flex items-center justify-between gap-2">
+                <Heading slot="title" className="text-2xl">
+                  {userUploadData.length > 0 ? t('modals.updateData') : t('modals.previewData')}
+                </Heading>
+                <Button
+                  className="flex aspect-square h-6 shrink-0 items-center justify-center rounded-xs text-sm text-(--color-font) ring-1 ring-transparent transition-all hover:bg-(--hl-xs) focus:ring-(--hl-md) focus:ring-inset aria-pressed:bg-(--hl-sm)"
+                  onPress={close}
+                >
+                  <Icon icon="x" />
+                </Button>
+              </div>
+              <div className="flex w-full shrink-0 grow basis-12 flex-col gap-6 overflow-hidden overflow-y-auto rounded-sm select-none">
+                <FileTrigger allowsMultiple={false} onSelect={handleFileSelect} acceptedFileTypes={['.csv', '.json']}>
+                  <Button className="flex flex-1 shrink-0 items-center justify-center gap-2 rounded-xs border border-solid border-(--hl-sm) px-2 py-1 text-base text-(--color-font) ring-1 ring-transparent transition-all hover:bg-(--hl-xs) focus:ring-inset aria-pressed:bg-(--hl-sm) aria-selected:bg-(--hl-sm)">
+                    <Icon icon="upload" />
+                    <span>{uploadData.length > 0 ? t('modals.changeDataFile') : t('modals.selectDataFile')}</span>
+                  </Button>
+                </FileTrigger>
+              </div>
+              {file && uploadData.length > 0 && (
+                <div>
+                  <span className="mr-4">{t('modals.fileEncoding')}</span>
+                  <EncodingPicker encoding={fileEncoding} onChange={handleEncodingChange} />
+                </div>
+              )}
+              {invalidFileReason !== '' && (
+                <div className="notice error margin-top-sm">
+                  <p>{invalidFileReason}</p>
+                </div>
+              )}
+              {uploadData.length > 0 && (
+                <div className="flex-1 overflow-auto py-2">
+                  <Heading className="margin-bottom-sm text-xl">{t('modals.dataPreview')}</Heading>
+                  <Table aria-label={t('modals.dataPreviewTable')} className="min-w-full table-auto">
+                    <TableHeader>
+                      <Column isRowHeader className={rowHeaderStyle}>
+                        {t('modals.iteration')}
+                      </Column>
+                      {uploadDataHeaders.map((header, idx) => (
+                        <Column
+                          // eslint-disable-next-line react/no-array-index-key
+                          key={`${header}-${idx}`}
+                          className={rowHeaderStyle}
+                        >
+                          {header}
+                        </Column>
+                      ))}
+                    </TableHeader>
+                    <TableBody>
+                      {uploadData.map((rowData, idx) => {
+                        return (
+                          // eslint-disable-next-line react/no-array-index-key
+                          <Row key={idx}>
+                            <Cell className={rowCellStyle}>
+                              <span className="p-2">{idx + 1}</span>
+                            </Cell>
+                            {uploadDataHeaders.map(rowKey => (
+                              <Cell
+                                className="border-b border-solid border-(--hl-sm) text-sm font-medium whitespace-nowrap group-last-of-type:border-none focus:outline-hidden"
+                                key={rowKey}
+                              >
+                                <span className="p-2">
+                                  {typeof rowData[rowKey] === 'string'
+                                    ? rowData[rowKey]
+                                    : JSON.stringify(rowData[rowKey])}
+                                </span>
+                              </Cell>
+                            ))}
+                          </Row>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                </div>
+              )}
+              <div className="mt-2 flex justify-end">
+                {userUploadData.length > 0 && (
+                  <Button
+                    className="flex items-center gap-2 rounded-xs border border-solid border-(--hl-md) px-3 py-2 text-(--hl) transition-colors hover:no-underline"
+                    onPress={handleClearData}
+                  >
+                    {t('modals.removeData')}
+                  </Button>
+                )}
+                <Button
+                  isDisabled={uploadData.length < 1}
+                  className="ml-4 flex items-center gap-2 rounded-xs border border-solid border-(--hl-md) bg-(--color-surprise) px-3 py-2 text-(--color-font-surprise) transition-colors hover:bg-(--color-surprise)/90 hover:no-underline"
+                  onPress={handleUploadData}
+                >
+                  {t('common.upload')}
+                </Button>
+              </div>
+            </div>
+          )}
+        </Dialog>
+      </Modal>
+    </ModalOverlay>
+  );
+};

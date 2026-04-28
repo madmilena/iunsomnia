@@ -1,0 +1,157 @@
+import React, { useEffect, useRef, useState } from 'react';
+import { OverlayContainer } from 'react-aria';
+import { useNavigate, useParams } from 'react-router';
+
+import type { RequestGroup } from '~/insomnia-data';
+import { useProjectListWorkspacesLoaderFetcher } from '~/routes/organization.$organizationId.project.$projectId.list-workspaces';
+import { useRequestGroupDuplicateActionFetcher } from '~/routes/organization.$organizationId.project.$projectId.workspace.$workspaceId.debug.request-group.duplicate';
+import { useI18n } from '~/ui/i18n';
+
+import { isNotNullOrUndefined } from '../../../common/misc';
+import { revalidateWorkspaceActiveRequestByFolder } from '../../../routes/organization.$organizationId.project.$projectId.workspace.$workspaceId';
+import { invariant } from '../../../utils/invariant';
+import { useRequestGroupPatcher } from '../../hooks/use-request';
+import { Modal, type ModalHandle, type ModalProps } from '../base/modal';
+import { ModalBody } from '../base/modal-body';
+import { ModalHeader } from '../base/modal-header';
+import { HelpTooltip } from '../help-tooltip';
+
+export interface RequestGroupSettingsModalOptions {
+  requestGroup: RequestGroup;
+}
+
+export const RequestGroupSettingsModal = ({
+  requestGroup,
+  onHide,
+}: ModalProps & {
+  requestGroup: RequestGroup;
+}) => {
+  const { t } = useI18n();
+  const modalRef = useRef<ModalHandle>(null);
+  const { organizationId, projectId, workspaceId } = useParams() as {
+    organizationId: string;
+    projectId: string;
+    workspaceId: string;
+  };
+  const workspacesFetcher = useProjectListWorkspacesLoaderFetcher();
+  useEffect(() => {
+    const isIdleAndUninitialized = workspacesFetcher.state === 'idle' && !workspacesFetcher.data;
+    if (isIdleAndUninitialized) {
+      workspacesFetcher.load({
+        organizationId,
+        projectId,
+      });
+    }
+  }, [organizationId, projectId, workspacesFetcher]);
+  const projectLoaderData = workspacesFetcher?.data;
+  const workspacesForActiveProject =
+    projectLoaderData?.files
+      .map(w => w.workspace)
+      .filter(isNotNullOrUndefined)
+      .filter(w => w.scope === 'collection' || w.scope === 'design') || [];
+  const [workspaceToCopyTo, setWorkspaceToCopyTo] = useState('');
+  const patchRequestGroup = useRequestGroupPatcher();
+
+  const duplicateRequestGroupFetcher = useRequestGroupDuplicateActionFetcher();
+
+  const duplicateRequestGroup = (requestGroupData: Partial<RequestGroup>) => {
+    duplicateRequestGroupFetcher.submit({
+      organizationId,
+      projectId,
+      workspaceId,
+      requestGroupData,
+    });
+  };
+  useEffect(() => {
+    modalRef.current?.show();
+  }, []);
+  const navigate = useNavigate();
+  const handleMoveToWorkspace = async () => {
+    invariant(workspaceToCopyTo, 'Workspace ID is required');
+    patchRequestGroup(requestGroup._id, { parentId: workspaceToCopyTo });
+    // if the folder is moved to a different workspace, we need to revalidate the active request
+    revalidateWorkspaceActiveRequestByFolder(requestGroup, workspaceId);
+    modalRef.current?.hide();
+    navigate(`/organization/${organizationId}/project/${projectId}/workspace/${workspaceToCopyTo}/debug`);
+  };
+
+  const handleCopyToWorkspace = async () => {
+    invariant(workspaceToCopyTo, 'Workspace ID is required');
+    duplicateRequestGroup({
+      _id: requestGroup._id,
+      name: requestGroup.name, // Because duplicate will add (Copy) suffix if name is not provided in patch
+      parentId: workspaceToCopyTo,
+    });
+  };
+
+  return (
+    <OverlayContainer onClick={e => e.stopPropagation()}>
+        <Modal ref={modalRef} onHide={onHide}>
+        <ModalHeader>
+          {t('modals.folderSettings')} <span className="txt-sm selectable faint monospace">{requestGroup?._id || ''}</span>
+        </ModalHeader>
+        <ModalBody className="pad">
+          <div>
+            <div className="form-control form-control--outlined">
+              <label>
+                {t('common.name')}
+                <input
+                  type="text"
+                  placeholder={requestGroup?.name || t('modals.myFolder')}
+                  defaultValue={requestGroup?.name}
+                  onChange={async event => {
+                    invariant(requestGroup, 'No request group');
+                    patchRequestGroup(requestGroup._id, { name: event.target.value });
+                  }}
+                />
+              </label>
+            </div>
+            <div className="form-row">
+              <div className="form-control form-control--outlined">
+                <label>
+                  {t('modals.moveCopyToWorkspace')}
+                  <HelpTooltip position="top" className="space-left">
+                    {t('modals.moveCopyFolderToWorkspaceHelp')}
+                  </HelpTooltip>
+                  <select
+                    value={workspaceToCopyTo}
+                    onChange={event => {
+                      setWorkspaceToCopyTo(event.currentTarget.value);
+                    }}
+                  >
+                    <option value="">{t('modals.selectWorkspaceOption')}</option>
+                    {workspacesForActiveProject
+                      .filter(w => workspaceId !== w._id)
+                      .map(w => (
+                        <option key={w._id} value={w._id}>
+                          {w.name}
+                        </option>
+                      ))}
+                  </select>
+                </label>
+              </div>
+              <div className="form-control form-control--no-label width-auto">
+                <button
+                  disabled={!workspaceToCopyTo}
+                  className="h-(--line-height-xs) rounded-md border border-solid border-(--hl-lg) px-(--padding-md) hover:bg-(--hl-xs)"
+                  onClick={handleCopyToWorkspace}
+                >
+                  {t('common.copy')}
+                </button>
+              </div>
+              <div className="form-control form-control--no-label width-auto">
+                <button
+                  disabled={!workspaceToCopyTo}
+                  className="h-(--line-height-xs) rounded-md border border-solid border-(--hl-lg) px-(--padding-md) hover:bg-(--hl-xs)"
+                  onClick={handleMoveToWorkspace}
+                >
+                  {t('common.move')}
+                </button>
+              </div>
+            </div>
+          </div>
+        </ModalBody>
+      </Modal>
+    </OverlayContainer>
+  );
+};

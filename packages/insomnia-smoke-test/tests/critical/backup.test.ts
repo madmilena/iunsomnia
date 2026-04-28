@@ -1,0 +1,21 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
+import { expect } from '@playwright/test';
+
+import { test } from '../../playwright/test';
+
+test('can backup data on new version available', async ({ app, page }) => {
+  const dataPath = await app.evaluate(async ({ app }) => app.getPath('userData'));
+  await page.getByRole('button', { name: 'Create request collection' }).click();
+  await page.getByRole('button', { name: 'Send' }).click();
+  await page.getByText('Error: URL using bad/illegal').click();
+  await page.getByRole('tab', { name: 'Console' }).click();
+  await page.getByText('No URL set').click();
+  const rootBackupsFolder = await fs.promises.readdir(path.join(dataPath, 'backups'));
+  const backupDir = await fs.promises.readdir(path.join(dataPath, 'backups', rootBackupsFolder[0]));
+  const hasFilesInsideBackup = backupDir.length > 0;
+  const hasProjectDbFile = backupDir.includes('insomnia.Project.db');
+  expect.soft(hasFilesInsideBackup).toBe(true);
+  expect.soft(hasProjectDbFile).toBe(true);
+});

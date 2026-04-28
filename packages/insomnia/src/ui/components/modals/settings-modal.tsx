@@ -1,0 +1,256 @@
+import { getOrganizationFeatures } from 'insomnia-api';
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
+import { Tab, TabList, TabPanel, Tabs } from 'react-aria-components';
+import { useParams } from 'react-router';
+
+import { AI_PLUGIN_NAME, isKonnectSyncEnabled } from '~/common/constants';
+import { isScratchpadOrganizationId } from '~/models/organization';
+import { getBundlePlugins } from '~/plugins';
+import { useRootLoaderData } from '~/root';
+import { SegmentEvent } from '~/ui/analytics';
+import { AISettings } from '~/ui/components/settings/ai-settings';
+import { CredentialsSettings } from '~/ui/components/settings/credentials';
+import { KonnectSettings } from '~/ui/components/settings/konnect-settings';
+import { useI18n } from '~/ui/i18n';
+
+import { getAppVersion, getProductName } from '../../../common/constants';
+import { Modal, type ModalHandle, type ModalProps } from '../base/modal';
+import { ModalBody } from '../base/modal-body';
+import { ModalHeader } from '../base/modal-header';
+import { BooleanSetting } from '../settings/boolean-setting';
+import { General } from '../settings/general';
+import { ImportExport } from '../settings/import-export';
+import { MaskedSetting } from '../settings/masked-setting';
+import { Plugins } from '../settings/plugins';
+import { Shortcuts } from '../settings/shortcuts';
+import { TextSetting } from '../settings/text-setting';
+import { ThemePanel } from '../settings/theme-panel';
+import { showModal } from './index';
+
+export interface SettingsModalHandle {
+  hide: () => void;
+  show: (options?: { tab?: SettingsModalTabKey }) => void;
+}
+
+type SettingsModalTabKey = 'data' | 'keyboard' | 'themes' | 'plugins' | 'general' | 'proxy' | 'credentials' | 'ai' | 'konnect';
+
+export const SettingsModal = forwardRef<SettingsModalHandle, ModalProps>((props, ref) => {
+  const { t } = useI18n();
+  const [defaultTabKey, setDefaultTabKey] = useState('general');
+  const { userSession, settings } = useRootLoaderData()!;
+  const modalRef = useRef<ModalHandle>(null);
+  const [keyboardClosable, setKeyboardClosable] = useState(true);
+  const { organizationId } = useParams() as { organizationId?: string };
+
+  const [shouldShowAiSettingsTab, setShouldShowAiSettingsTab] = useState(false);
+  const [shouldShowKonnectTab, setShouldShowKonnectTab] = useState(false);
+
+  useEffect(() => {
+    const checkFeatures = async () => {
+      const plugins = await getBundlePlugins();
+      const aiPlugin = plugins.find(p => p.name === AI_PLUGIN_NAME);
+      setShouldShowAiSettingsTab(!!aiPlugin && !!userSession.id);
+
+      if (isKonnectSyncEnabled() && userSession.id && organizationId && !isScratchpadOrganizationId(organizationId)) {
+        try {
+          const res = await getOrganizationFeatures({ organizationId, sessionId: userSession.id });
+          setShouldShowKonnectTab(res?.features?.konnectSync?.enabled ?? false);
+        } catch {
+          setShouldShowKonnectTab(false);
+        }
+      } else {
+        setShouldShowKonnectTab(false);
+      }
+    };
+    checkFeatures();
+  }, [userSession.id, organizationId]);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      hide: () => {
+        modalRef.current?.hide();
+      },
+      show: options => {
+        setDefaultTabKey(options?.tab || 'general');
+        modalRef.current?.show();
+      },
+    }),
+    [],
+  );
+
+  return (
+    <Modal
+      dataTestId="preference-modal"
+      className="z-10!"
+      ref={modalRef}
+      tall
+      keyboardClosable={keyboardClosable}
+      {...props}
+    >
+      <ModalHeader>
+        {t('modals.productPreferences', { productName: getProductName() })}
+        <span className="faint txt-sm">
+          &nbsp;&nbsp;–&nbsp; v{getAppVersion()}
+          {userSession.id && userSession.email ? ` – ${userSession.email}` : null}
+        </span>
+      </ModalHeader>
+      <ModalBody noScroll>
+        <Tabs
+          selectedKey={defaultTabKey}
+          onSelectionChange={key => {
+            setDefaultTabKey(key.toString());
+
+            window.main.trackSegmentEvent({
+              event: SegmentEvent.preferencesViewed,
+              properties: { tab: key.toString() },
+            });
+          }}
+          aria-label={t('common.settings')}
+          className="flex h-full w-full flex-1 flex-col"
+        >
+          <TabList
+            className="flex h-(--line-height-sm) w-full shrink-0 items-center overflow-x-auto border-b border-solid border-b-(--hl-md) bg-(--color-bg)"
+            aria-label={t('modals.settingsTabs')}
+          >
+            <Tab
+              className="flex h-full shrink-0 cursor-pointer items-center justify-between gap-2 px-3 py-1 text-(--hl) outline-hidden transition-colors duration-300 select-none hover:bg-(--hl-sm) hover:text-(--color-font) focus:bg-(--hl-sm) aria-selected:bg-(--hl-xs) aria-selected:text-(--color-font) aria-selected:hover:bg-(--hl-sm) aria-selected:focus:bg-(--hl-sm)"
+              id="general"
+            >
+              {t('settings.general')}
+            </Tab>
+            <Tab
+              className="flex h-full shrink-0 cursor-pointer items-center justify-between gap-2 px-3 py-1 text-(--hl) outline-hidden transition-colors duration-300 select-none hover:bg-(--hl-sm) hover:text-(--color-font) focus:bg-(--hl-sm) aria-selected:bg-(--hl-xs) aria-selected:text-(--color-font) aria-selected:hover:bg-(--hl-sm) aria-selected:focus:bg-(--hl-sm)"
+              id="proxy"
+            >
+              {t('settings.proxy')}
+            </Tab>
+            <Tab
+              className="flex h-full shrink-0 cursor-pointer items-center justify-between gap-2 px-3 py-1 text-(--hl) outline-hidden transition-colors duration-300 select-none hover:bg-(--hl-sm) hover:text-(--color-font) focus:bg-(--hl-sm) aria-selected:bg-(--hl-xs) aria-selected:text-(--color-font) aria-selected:hover:bg-(--hl-sm) aria-selected:focus:bg-(--hl-sm)"
+              id="data"
+            >
+              {t('settings.data')}
+            </Tab>
+            <Tab
+              className="flex h-full shrink-0 cursor-pointer items-center justify-between gap-2 px-3 py-1 text-(--hl) outline-hidden transition-colors duration-300 select-none hover:bg-(--hl-sm) hover:text-(--color-font) focus:bg-(--hl-sm) aria-selected:bg-(--hl-xs) aria-selected:text-(--color-font) aria-selected:hover:bg-(--hl-sm) aria-selected:focus:bg-(--hl-sm)"
+              id="themes"
+            >
+              {t('settings.themes')}
+            </Tab>
+            <Tab
+              className="flex h-full shrink-0 cursor-pointer items-center justify-between gap-2 px-3 py-1 text-(--hl) outline-hidden transition-colors duration-300 select-none hover:bg-(--hl-sm) hover:text-(--color-font) focus:bg-(--hl-sm) aria-selected:bg-(--hl-xs) aria-selected:text-(--color-font) aria-selected:hover:bg-(--hl-sm) aria-selected:focus:bg-(--hl-sm)"
+              id="keyboard"
+            >
+              {t('settings.keyboardShort')}
+            </Tab>
+            <Tab
+              className="flex h-full shrink-0 cursor-pointer items-center justify-between gap-2 px-3 py-1 text-(--hl) outline-hidden transition-colors duration-300 select-none hover:bg-(--hl-sm) hover:text-(--color-font) focus:bg-(--hl-sm) aria-selected:bg-(--hl-xs) aria-selected:text-(--color-font) aria-selected:hover:bg-(--hl-sm) aria-selected:focus:bg-(--hl-sm)"
+              id="plugins"
+            >
+              {t('settings.plugins')}
+            </Tab>
+            <Tab
+              className="flex h-full shrink-0 cursor-pointer items-center justify-between gap-2 px-3 py-1 text-(--hl) outline-hidden transition-colors duration-300 select-none hover:bg-(--hl-sm) hover:text-(--color-font) focus:bg-(--hl-sm) aria-selected:bg-(--hl-xs) aria-selected:text-(--color-font) aria-selected:hover:bg-(--hl-sm) aria-selected:focus:bg-(--hl-sm)"
+              id="credentials"
+            >
+              {t('settings.credentialsTitle')}
+            </Tab>
+            {shouldShowAiSettingsTab && (
+              <Tab
+                className="flex h-full shrink-0 cursor-pointer items-center justify-between gap-2 px-3 py-1 text-(--hl) outline-hidden transition-colors duration-300 select-none hover:bg-(--hl-sm) hover:text-(--color-font) focus:bg-(--hl-sm) aria-selected:bg-(--hl-xs) aria-selected:text-(--color-font) aria-selected:hover:bg-(--hl-sm) aria-selected:focus:bg-(--hl-sm)"
+                id="ai"
+              >
+                {t('settings.aiSettings')}
+              </Tab>
+            )}
+            {shouldShowKonnectTab && (
+              <Tab
+                className="flex h-full shrink-0 cursor-pointer items-center justify-between gap-2 px-3 py-1 text-(--hl) outline-hidden transition-colors duration-300 select-none hover:bg-(--hl-sm) hover:text-(--color-font) focus:bg-(--hl-sm) aria-selected:bg-(--hl-xs) aria-selected:text-(--color-font) aria-selected:hover:bg-(--hl-sm) aria-selected:focus:bg-(--hl-sm)"
+                id="konnect"
+              >
+                {t('settings.konnectTitle')}
+              </Tab>
+            )}
+          </TabList>
+          <TabPanel className="h-full w-full overflow-y-auto" id="general">
+            <General />
+          </TabPanel>
+          <TabPanel className="h-full w-full overflow-y-auto p-4" id="proxy">
+            <h2 className="sticky top-0 left-0 z-10 bg-(--color-bg) pt-2 pb-2 text-lg font-bold">
+              {t('settings.networkProxy')}
+            </h2>
+
+            <BooleanSetting
+              label={t('settings.enableProxy')}
+              setting="proxyEnabled"
+              help={t('settings.enableProxyHelp')}
+            />
+
+            <div className="form-row pad-top-sm">
+              <MaskedSetting
+                label={t('settings.proxyForHttp')}
+                setting="httpProxy"
+                help={t('settings.proxyForHttpHelp')}
+                placeholder="localhost:8005"
+                disabled={!settings.proxyEnabled}
+              />
+              <MaskedSetting
+                label={t('settings.proxyForHttps')}
+                setting="httpsProxy"
+                help={t('settings.proxyForHttpsHelp')}
+                placeholder="localhost:8005"
+                disabled={!settings.proxyEnabled}
+              />
+              <TextSetting
+                label={t('settings.noProxy')}
+                setting="noProxy"
+                help={t('settings.noProxyHelp')}
+                placeholder="localhost,127.0.0.1"
+                disabled={!settings.proxyEnabled}
+              />
+            </div>
+          </TabPanel>
+          <TabPanel className="h-full w-full overflow-y-auto p-4" id="data">
+            <ImportExport
+              hideSettingsModal={() => modalRef.current?.hide()}
+              onModalChange={(isOpen: boolean) => setKeyboardClosable(!isOpen)}
+            />
+          </TabPanel>
+          <TabPanel className="h-full w-full overflow-y-auto p-4" id="themes">
+            <ThemePanel />
+          </TabPanel>
+          <TabPanel className="h-full w-full overflow-y-auto p-4" id="keyboard">
+            <Shortcuts />
+          </TabPanel>
+          <TabPanel className="h-full w-full overflow-y-auto p-4" id="plugins">
+            <Plugins />
+          </TabPanel>
+          <TabPanel className="h-full w-full overflow-y-auto p-4" id="credentials">
+            <CredentialsSettings />
+          </TabPanel>
+          {shouldShowAiSettingsTab && (
+            <TabPanel className="relative h-full w-full overflow-y-auto p-4" id="ai">
+              <AISettings />
+            </TabPanel>
+          )}
+          {shouldShowKonnectTab && (
+            <TabPanel className="h-full w-full overflow-y-auto" id="konnect">
+              <KonnectSettings />
+            </TabPanel>
+          )}
+        </Tabs>
+      </ModalBody>
+    </Modal>
+  );
+});
+
+SettingsModal.displayName = 'SettingsModal';
+
+export const showSettingsModal = (options?: { tab?: SettingsModalTabKey }) => {
+  showModal(SettingsModal, options);
+
+  window.main.trackSegmentEvent({
+    event: SegmentEvent.preferencesViewed,
+    properties: { tab: options?.tab || 'general' },
+  });
+};

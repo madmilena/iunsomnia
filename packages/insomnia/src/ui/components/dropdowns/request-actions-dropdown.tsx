@@ -1,0 +1,384 @@
+import type { IconName } from '@fortawesome/fontawesome-svg-core';
+import React, { Fragment, useCallback, useState } from 'react';
+import { Button, Collection, Header, Menu, MenuItem, MenuSection, MenuTrigger, Popover } from 'react-aria-components';
+import { useParams } from 'react-router';
+
+import type {
+  Environment,
+  GrpcRequest,
+  Request,
+  RequestGroup,
+  SocketIORequest,
+  WebSocketRequest,
+} from '~/insomnia-data';
+import { models, services } from '~/insomnia-data';
+import { useRootLoaderData } from '~/root';
+import { useWorkspaceLoaderData } from '~/routes/organization.$organizationId.project.$projectId.workspace.$workspaceId';
+import { useRequestDuplicateActionFetcher } from '~/routes/organization.$organizationId.project.$projectId.workspace.$workspaceId.debug.request.$requestId.duplicate';
+import { useRequestDeleteActionFetcher } from '~/routes/organization.$organizationId.project.$projectId.workspace.$workspaceId.debug.request.delete';
+import { SegmentEvent } from '~/ui/analytics';
+import { useTabNavigate } from '~/ui/hooks/use-insomnia-tab';
+
+import { exportHarRequest } from '../../../common/har';
+import { toKebabCase } from '../../../common/misc';
+import type { PlatformKeyCombinations } from '../../../common/settings';
+import type { RequestAction } from '../../../plugins';
+import { getRequestActions } from '../../../plugins';
+import * as pluginApp from '../../../plugins/context/app';
+import * as pluginData from '../../../plugins/context/data';
+import * as pluginNetwork from '../../../plugins/context/network';
+import * as pluginStore from '../../../plugins/context/store';
+import { useRequestMetaPatcher } from '../../hooks/use-request';
+import { DropdownHint } from '../base/dropdown/dropdown-hint';
+import { Icon } from '../icon';
+import { showError, showModal } from '../modals';
+import { AlertModal } from '../modals/alert-modal';
+import { AskModal } from '../modals/ask-modal';
+import { GenerateCodeModal } from '../modals/generate-code-modal';
+import { PromptModal } from '../modals/prompt-modal';
+import { RequestSettingsModal } from '../modals/request-settings-modal';
+
+const { isRequest } = models.request;
+
+interface Props {
+  activeEnvironment: Environment;
+  isPinned: boolean;
+  request: Request | GrpcRequest | WebSocketRequest | SocketIORequest;
+  requestGroup?: RequestGroup;
+  isOpen: boolean;
+  triggerRef: React.RefObject<HTMLDivElement>;
+  onOpenChange: (isOpen: boolean) => void;
+  onRename: () => void;
+}
+
+export const RequestActionsDropdown = ({
+  activeEnvironment,
+  isPinned,
+  request,
+  isOpen,
+  triggerRef,
+  onOpenChange,
+  onRename,
+}: Props) => {
+  const { settings } = useRootLoaderData()!;
+  const { activeProject, activeWorkspace } = useWorkspaceLoaderData()!;
+  const patchRequestMeta = useRequestMetaPatcher();
+  const { hotKeyRegistry } = settings;
+  const [actionPlugins, setActionPlugins] = useState<RequestAction[]>([]);
+  const duplicateRequestFetcher = useRequestDuplicateActionFetcher();
+  const deleteRequestFetcher = useRequestDeleteActionFetcher();
+  const { organizationId, projectId, workspaceId } = useParams() as {
+    organizationId: string;
+    projectId: string;
+    workspaceId: string;
+  };
+
+  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const tabNavigate = useTabNavigate();
+
+  const openInNewTab = async () => {
+    window.main.trackSegmentEvent({ event: SegmentEvent.requestOpenInNewTabClicked });
+    tabNavigate(
+      {
+        organization: organizationId,
+        project: activeProject,
+        workspace: activeWorkspace,
+        item: request,
+      },
+      {
+        withTab: true,
+        shouldNavigate: true,
+      },
+    );
+  };
+
+  const onOpen = useCallback(async () => {
+    const actionPlugins = await getRequestActions();
+    setActionPlugins(actionPlugins);
+  }, []);
+
+  const handleDuplicateRequest = () => {
+    if (!request) {
+      return;
+    }
+    window.main.trackSegmentEvent({ event: SegmentEvent.requestListMenuDuplicateClicked });
+
+    showModal(PromptModal, {
+      title: 'Duplicate Request',
+      defaultValue: request.name,
+      submitName: 'Create',
+      label: 'New Name',
+      selectText: true,
+      onComplete: (name: string) =>
+        duplicateRequestFetcher.submit({
+          organizationId,
+          projectId,
+          workspaceId,
+          requestId: request._id,
+          name,
+        }),
+    });
+  };
+
+  const handlePluginClick = async ({ plugin, action }: RequestAction) => {
+    try {
+      const context = {
+        ...pluginApp.init(),
+        ...pluginData.init(activeProject._id),
+        ...pluginStore.init(plugin),
+        ...pluginNetwork.init(),
+      };
+      await action(context, {
+        request,
+      });
+    } catch (error) {
+      showError({
+        title: 'Plugin Action Failed',
+        error,
+      });
+    }
+  };
+
+  const generateCode = () => {
+    if (isRequest(request)) {
+      window.main.trackSegmentEvent({
+        event: SegmentEvent.generateCodeClicked,
+      });
+
+      showModal(GenerateCodeModal, { request });
+    }
+  };
+
+  const copyAsCurl = async () => {
+    try {
+      const har = await exportHarRequest(request._id, activeEnvironment._id);
+      const { HTTPSnippet } = await import('httpsnippet');
+      const snippet = new HTTPSnippet(har);
+      const cmd = snippet.convert('shell', 'curl');
+
+      if (cmd) {
+        window.clipboard.writeText(cmd);
+      }
+
+      window.main.trackSegmentEvent({
+        event: SegmentEvent.copyAsCurl,
+      });
+    } catch (err) {
+      showModal(AlertModal, {
+        title: 'Could not generate cURL',
+        message: err instanceof Error ? err.message : 'Unknown error',
+      });
+    }
+  };
+
+  const togglePin = () => {
+    window.main.trackSegmentEvent({ event: SegmentEvent.requestListMenuPinClicked });
+    patchRequestMeta(request._id, { pinned: !isPinned });
+  };
+
+  const deleteRequest = () => {
+    showModal(AskModal, {
+      title: 'Delete Request',
+      message: `Do you really want to delete "${request.name}"?`,
+      yesText: 'Delete',
+      noText: 'Cancel',
+      color: 'danger',
+      onDone: async (isYes: boolean) => {
+        if (isYes) {
+          services.stats.incrementDeletedRequests();
+          deleteRequestFetcher.submit({
+            organizationId,
+            projectId,
+            workspaceId,
+            id: request._id,
+          });
+        }
+      },
+    });
+  };
+
+  // Can only generate code for regular requests, not gRPC requests
+  const canGenerateCode = isRequest(request);
+
+  const codeGenerationActions: {
+    name: string;
+    id: string;
+    icon: IconName;
+    items: {
+      id: string;
+      name: string;
+      icon: IconName;
+      hint?: PlatformKeyCombinations;
+      action: () => void;
+    }[];
+  }[] = !canGenerateCode
+    ? []
+    : [
+        {
+          name: 'Export',
+          id: 'export',
+          icon: 'file-export',
+          items: [
+            {
+              id: 'GenerateCode',
+              name: 'Generate Code',
+              action: generateCode,
+              icon: 'code',
+              hint: hotKeyRegistry.request_showGenerateCodeEditor,
+            },
+            {
+              id: 'CopyAsCurl',
+              name: 'Copy as cURL',
+              action: copyAsCurl,
+              icon: 'copy',
+            },
+          ],
+        },
+      ];
+
+  const requestActionList: {
+    name: string;
+    id: string;
+    icon: IconName;
+    items: {
+      id: string;
+      name: string;
+      icon: IconName;
+      hint?: PlatformKeyCombinations;
+      action: () => void;
+    }[];
+  }[] = [
+    ...codeGenerationActions,
+    {
+      name: 'Actions',
+      id: 'actions',
+      icon: 'cog',
+      items: [
+        {
+          id: 'OpenInNewTab',
+          name: 'Open in New Tab',
+          action: openInNewTab,
+          icon: 'external-link-alt',
+          hint: hotKeyRegistry.request_openInNewTab,
+        },
+        {
+          id: 'Pin',
+          name: isPinned ? 'Unpin' : 'Pin',
+          action: togglePin,
+          icon: 'thumbtack',
+          hint: hotKeyRegistry.request_togglePin,
+        },
+        {
+          id: 'Duplicate',
+          name: 'Duplicate',
+          action: handleDuplicateRequest,
+          icon: 'copy',
+          hint: hotKeyRegistry.request_showDuplicate,
+        },
+        {
+          id: 'Rename',
+          name: 'Rename',
+          action: () => {
+            window.main.trackSegmentEvent({ event: SegmentEvent.requestListMenuRenameClicked });
+            onRename();
+          },
+          icon: 'edit',
+        },
+        {
+          id: 'Delete',
+          name: 'Delete',
+          action: deleteRequest,
+          icon: 'trash',
+          hint: hotKeyRegistry.request_showDelete,
+        },
+        {
+          id: 'Settings',
+          name: 'Settings',
+          icon: 'gear',
+          hint: hotKeyRegistry.request_showSettings,
+          action: () => {
+            window.main.trackSegmentEvent({ event: SegmentEvent.requestListMenuSettingsClicked });
+            setIsSettingsModalOpen(true);
+          },
+        },
+      ],
+    },
+    ...(actionPlugins.length > 0
+      ? [
+          {
+            name: 'Plugins',
+            id: 'plugins',
+            icon: 'plug' as IconName,
+            items: actionPlugins.map(plugin => ({
+              id: plugin.label,
+              name: plugin.label,
+              icon: (plugin.icon as IconName) || 'plug',
+              action: () => handlePluginClick(plugin),
+            })),
+          },
+        ]
+      : []),
+  ];
+
+  return (
+    <Fragment>
+      <MenuTrigger
+        isOpen={isOpen}
+        onOpenChange={isOpen => {
+          isOpen && onOpen();
+          onOpenChange(isOpen);
+        }}
+      >
+        <Button
+          data-testid={`Dropdown-${toKebabCase(request.name)}`}
+          aria-label="Request Actions"
+          className="hidden aspect-square h-6 items-center justify-center rounded-xs text-sm text-(--color-font) ring-1 ring-transparent transition-all group-hover:flex group-focus:flex hover:bg-(--hl-xs) focus:ring-(--hl-md) focus:ring-inset aria-pressed:bg-(--hl-sm)"
+        >
+          <Icon icon="caret-down" />
+        </Button>
+        <Popover
+          className="flex min-w-max flex-col overflow-y-hidden"
+          triggerRef={triggerRef}
+          placement="bottom end"
+          offset={5}
+        >
+          <Menu
+            aria-label="Request Actions Menu"
+            selectionMode="single"
+            onAction={key =>
+              requestActionList
+                .find(i => i.items.find(a => a.id === key))
+                ?.items.find(a => a.id === key)
+                ?.action()
+            }
+            items={requestActionList}
+            className="min-w-max overflow-y-auto rounded-md border border-solid border-(--hl-sm) bg-(--color-bg) py-2 text-sm shadow-lg select-none focus:outline-hidden"
+          >
+            {section => (
+              <MenuSection className="flex flex-1 flex-col">
+                <Header className="flex items-center gap-2 py-1 pl-2 text-xs text-(--hl) uppercase">
+                  <Icon icon={section.icon} /> <span>{section.name}</span>
+                </Header>
+                <Collection items={section.items}>
+                  {item => (
+                    <MenuItem
+                      key={item.id}
+                      id={item.id}
+                      className="flex h-(--line-height-xs) w-full items-center gap-2 bg-transparent px-(--padding-md) whitespace-nowrap text-(--color-font) transition-colors hover:bg-(--hl-sm) focus:bg-(--hl-xs) focus:outline-hidden disabled:cursor-not-allowed aria-selected:font-bold"
+                      aria-label={item.name}
+                    >
+                      <Icon icon={item.icon} />
+                      <span>{item.name}</span>
+                      {item.hint && <DropdownHint keyBindings={item.hint} />}
+                    </MenuItem>
+                  )}
+                </Collection>
+              </MenuSection>
+            )}
+          </Menu>
+        </Popover>
+      </MenuTrigger>
+      {isSettingsModalOpen && <RequestSettingsModal request={request} onHide={() => setIsSettingsModalOpen(false)} />}
+    </Fragment>
+  );
+};
